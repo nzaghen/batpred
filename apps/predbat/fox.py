@@ -95,6 +95,9 @@ FOX_REFRESH_REALTIME = 5  # Real time monitoring data
 # The website's live energy-flow socket is separate from OpenAPI telemetry. Never
 # promote its cached/keepalive frames to current readings, even while connected.
 FOX_CLOUD_MAX_AGE = 30
+FOX_PLANNER_FIELDS = {"soc_percent": "soc", "battery_power": "invbatpower", "grid_power": "meterpower", "pv_power": "pvpower", "load_power": "loadspower"}
+FOX_SIGNED_POWER_FIELDS = {"invbatpower", "meterpower", "meterpower2"}
+FOX_POWER_FIELDS = FOX_SIGNED_POWER_FIELDS | {field.casefold() for field in ("batChargePower", "batDischargePower", "gridConsumptionPower", "feedinPower", "pvPower", "loadsPower", "generationPower", "epsPower")}
 FOX_CLOUD_LOGIN_PATH = "/basic/v0/user/login"
 FOX_CLOUD_WS_PATH = "/dew/v0/wsmaitian"
 FOX_CLOUD_V1_LOGIN_PATH = "/c/v0/user/login"
@@ -144,7 +147,7 @@ def fox_cloud_power(node):
     if not isinstance(power, dict) or power.get("display") is False:
         return None
     value = fox_cloud_number(power.get("value"))
-    unit = power.get("unit", "W")
+    unit = power.get("unit")
     if value is None or unit not in ("W", "kW"):
         return None
     return value / 1000.0 if unit == "W" else value
@@ -198,9 +201,25 @@ class FoxCloudError(ValueError):
     """A website failure containing only a controlled, credential-free reason."""
 
 
+def fox_valid_planner_value(variable, item):
+    """Reject malformed SoC and power instead of handing them to planner defaults."""
+    if not isinstance(item, dict):
+        return False
+    value = fox_cloud_number(item.get("value"))
+    if value is None:
+        return False
+    variable = variable.casefold()
+    if variable == "soc" or variable.startswith("soc_"):
+        return item.get("unit") == "%" and 0 <= value <= 100
+    if variable in FOX_POWER_FIELDS:
+        unit = item.get("unit")
+        return unit in ("W", "kW") and math.isfinite(value * (1000 if unit == "kW" else 1)) and (variable in FOX_SIGNED_POWER_FIELDS or value >= 0)
+    return True
+
+
 def fox_cloud_planner_values(values):
     """Add signed power readings used by the planner from website-only flow pairs."""
-    values = values.copy()
+    values = {key: item for key, item in values.items() if fox_valid_planner_value(key, item)}
     names = {key.casefold(): key for key in values}
     for target, positive, negative, name in (
         ("invBatPower", "batDischargePower", "batChargePower", "Battery Power"),
@@ -329,6 +348,11 @@ class FoxCloudStream:
 
     async def accept_values(self, values, age, version):
         """Publish a source transition once and retain its bounded status snapshot."""
+        # Keep cumulative energy on one source. Switching between website and
+        # OpenAPI counters can roll a total backwards and corrupt energy history.
+        values = fox_cloud_planner_values({key: item for key, item in values.items() if item.get("unit") not in ("Wh", "kWh")})
+        if not values:
+            return
         for item in values.values():
             item["website_version"] = version
             item.setdefault("sample_age_known", version == "v2")
@@ -361,6 +385,8 @@ class FoxCloudStream:
                     message = await asyncio.wait_for(socket.receive(), timeout=min(deadline, next_request) - now)
                 except asyncio.TimeoutError:
                     continue
+                if time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError("Website frame arrived after its freshness deadline")
                 if message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.ERROR):
                     raise ConnectionError("Website stream closed")
                 if message.type != aiohttp.WSMsgType.TEXT:
@@ -423,22 +449,26 @@ class FoxCloudStream:
                 values = fox_v1_values(reply, self.owner.device_values.get(self.device_sn, {}))
                 if not values:
                     continue
+                received_at = time.monotonic()
+                entries.update({key: (item, received_at + FOX_CLOUD_MAX_AGE) for key, item in values.items()})
                 has_recent_soc = any(key.casefold() == "soc" and time.monotonic() + 10 < expiry for key, (item, expiry) in entries.items())
                 if not any(key.casefold() == "soc" for key in values) and not has_recent_soc and self.owner.device_detail.get(self.device_sn, {}).get("hasBattery") and time.monotonic() >= next_battery:
-                    battery = await self.v1_request(session, token, "/generic/v0/device/battery/info", {"id": device["id"]})
+                    battery = await asyncio.wait_for(self.v1_request(session, token, "/generic/v0/device/battery/info", {"id": device["id"]}), timeout=max(0, deadline - time.monotonic()))
                     packs = battery.get("batterys", [])
                     socs = [fox_cloud_number(pack.get("soc")) for pack in packs if isinstance(pack, dict)]
                     if socs and all(soc is not None and 0 <= soc <= 100 for soc in socs):
-                        values["SoC"] = {"value": sum(socs) / len(socs), "name": "SoC", "unit": "%", "source": "fox_cloud_v1", "sample_age_known": False}
+                        item = {"value": sum(socs) / len(socs), "name": "SoC", "unit": "%", "source": "fox_cloud_v1", "sample_age_known": False}
+                        entries["SoC"] = (item, time.monotonic() + FOX_CLOUD_MAX_AGE)
                     next_battery = time.monotonic() + 20
                 # The two subscriptions arrive separately; keep fields only for
                 # 30 seconds since their own last update. Flow-only keepalive frames
                 # must not extend the lifetime of absent detailed readings.
                 now = time.monotonic()
-                entries.update({key: (item, now + FOX_CLOUD_MAX_AGE) for key, item in values.items()})
                 combined = {key: item for key, (item, expiry) in entries.items() if now < expiry}
-                await self.accept_values(combined, 0, "v1")
-                self.expires_at = min(expiry for key, (item, expiry) in entries.items() if key in combined)
+                if not combined or now >= deadline:
+                    raise asyncio.TimeoutError("Website readings expired during battery request")
+                expires_at = min(expiry for key, (item, expiry) in entries.items() if key in combined)
+                await self.accept_values(combined, FOX_CLOUD_MAX_AGE - (expires_at - now), "v1")
                 deadline = self.expires_at
 
     async def run(self):
@@ -822,6 +852,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
         self.cloud_username = cloud_username
         self.cloud_password = cloud_password
         self.cloud_streams = {}
+        self.cloud_device_list = None
         if bool(cloud_username) != bool(cloud_password):
             self.log("Warn: Fox: Both fox_cloud_username and fox_cloud_password are required for live status; using OpenAPI")
 
@@ -1033,12 +1064,17 @@ class FoxAPI(ComponentBase, OAuthMixin):
         if not getattr(self, "cloud_username", None) or not getattr(self, "cloud_password", None):
             return
         plants = {}
-        for device in self.device_list:
+        inventory = getattr(self, "cloud_device_list", self.device_list)
+        unknown_plant = False
+        for device in inventory or []:
             sn = device.get("deviceSN")
-            plant = self.device_detail.get(sn, {}).get("stationID")
+            plant = device.get("stationID") or self.device_detail.get(sn, {}).get("stationID")
             if sn and plant:
                 plants.setdefault(str(plant), []).append(sn)
-        eligible = {sns[0]: plant for plant, sns in plants.items() if len(sns) == 1}
+            elif sn:
+                unknown_plant = True
+        selected = {device.get("deviceSN") for device in self.device_list}
+        eligible = {} if unknown_plant else {sns[0]: plant for plant, sns in plants.items() if len(sns) == 1 and sns[0] in selected}
         for sn, stream in list(self.cloud_streams.items()):
             if eligible.get(sn) != stream.plant_id or stream.task.done():
                 stream.task.cancel()
@@ -1058,6 +1094,24 @@ class FoxAPI(ComponentBase, OAuthMixin):
             # repeated login failure must not increase normal OpenAPI usage.
             self.data_age.pop("device_values", None)
         await self.publish_data(live_only=True)
+
+    def planner_data_error(self, index):
+        """Reject invalid inputs and expired website data only in live-enabled setups."""
+        if not getattr(self, "cloud_username", None) or not getattr(self, "cloud_password", None):
+            return None
+        for argument, suffix in FOX_PLANNER_FIELDS.items():
+            entity = self.base.get_arg(argument, default=None, indirect=False, index=index)
+            if not isinstance(entity, str) or not entity.startswith(f"sensor.{self.prefix}_fox_") or not entity.endswith("_" + suffix):
+                continue
+            reading = self.base.get_state_wrapper(entity, raw=True)
+            attributes = reading.get("attributes", {}) if isinstance(reading, dict) else {}
+            deadline = fox_cloud_number(attributes.get("valid_until"))
+            item = {"value": reading.get("state") if isinstance(reading, dict) else None, "unit": attributes.get("unit_of_measurement")}
+            invalid = not fox_valid_planner_value(suffix, item)
+            expired = attributes.get("source") in ("fox_cloud", "fox_cloud_v1") and (deadline is None or time.time() >= deadline)
+            if invalid or expired:
+                return f"Fox {argument} is unavailable, invalid or stale ({entity}); new planning and execution suspended"
+        return None
 
     async def final(self):
         """Cancel live readers and close their sockets/sessions during shutdown."""
@@ -2164,6 +2218,13 @@ class FoxAPI(ComponentBase, OAuthMixin):
         if result is None:
             return None
         devices = result.get("data", [])
+        # A serial filter must not turn a plant-wide feed into per-inverter
+        # telemetry. Keep the complete membership separately, in memory only.
+        total = fox_cloud_number(result.get("total"))
+        complete = total == len(devices) if total is not None else len(devices) < query["pageSize"]
+        self.cloud_device_list = devices.copy() if complete else None
+        if not complete and getattr(self, "cloud_username", None):
+            self.log("Warn: Fox: Incomplete device inventory; website status disabled until plant membership can be verified")
         # If self.inverter_sn_filter is set, keep only devices whose deviceSN is in that filter
         if self.inverter_sn_filter:
             devices = [device for device in devices if device.get("deviceSN", "") in self.inverter_sn_filter]
@@ -2423,11 +2484,12 @@ class FoxAPI(ComponentBase, OAuthMixin):
                     # unavailable on fallback, rather than stay falsely current.
                     values[variable] = {**item, "value": None, "source": "openapi", "timestamp": ""}
             if live:
+                valid_until = time.time() + max(0, stream.expires_at - time.monotonic())
                 for variable, item in live.items():
                     for key in list(values):
                         if key.lower() == variable.lower():
                             del values[key]
-                    values[variable] = item
+                    values[variable] = {**item, "valid_until": valid_until}
 
         # Publish device values
         for sn in device_values:
@@ -2447,6 +2509,8 @@ class FoxAPI(ComponentBase, OAuthMixin):
                     "source": item.get("source", "openapi"),
                     "timestamp": item.get("timestamp", ""),
                 }
+                if "valid_until" in item:
+                    attributes["valid_until"] = item["valid_until"]
                 if "website_version" in item:
                     attributes["website_version"] = item["website_version"]
                     attributes["sample_age_known"] = item.get("sample_age_known", False)

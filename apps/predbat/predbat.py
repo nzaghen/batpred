@@ -1492,6 +1492,15 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         (the error will already have been recorded), otherwise the (status, status_extra)
         tuple from execute_plan().
         """
+        fox = self.components.get_component("fox") if self.components else None
+        if fox:
+            for index in range(int(self.get_arg("num_inverters", 1))):
+                error = fox.planner_data_error(index)
+                if error:
+                    self.plan_valid = False
+                    self.log("Error: " + error)
+                    self.record_status("Error: " + error, had_errors=True)
+                    return None
         if refetch_inverter:
             if not self.fetch_inverter_data():
                 self.log("Error: Failed to fetch inverter data, not able to execute the plan")

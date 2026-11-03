@@ -1364,6 +1364,15 @@ class Execute:
         """
         # Find the inverters
         self.num_inverters = int(self.get_arg("num_inverters", 1))
+        fox = self.components.get_component("fox") if self.components else None
+        if fox:
+            for index in range(self.num_inverters):
+                error = fox.planner_data_error(index)
+                if error:
+                    self.plan_valid = False
+                    self.log("Error: " + error)
+                    self.record_status("Error: " + error, had_errors=True)
+                    return False
         self.charge_window = []
         self.export_window = []
         self.export_limits = []

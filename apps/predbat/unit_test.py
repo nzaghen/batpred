@@ -240,6 +240,7 @@ from tests.test_octopus_dispatch_hold import test_octopus_dispatch_hold
 from tests.test_dispatch_billing_window import test_dispatch_billing_window
 from tests.test_fox_api import run_fox_api_tests
 from tests.test_fox_realtime import run_fox_realtime_tests
+from tests.test_fox_safety import run_fox_safety_tests
 from tests.test_deye_const import run_deye_const_tests
 from tests.test_deye_config import run_deye_config_tests
 from tests.test_deye_api import run_deye_api_tests
@@ -699,6 +700,7 @@ def main():
         ("alert_feed", test_alert_feed, "Alert feed tests", False),
         ("fox_api", run_fox_api_tests, "Fox API tests", False),
         ("fox_realtime", run_fox_realtime_tests, "Fox website live status and OpenAPI fallback tests", False),
+        ("fox_safety", run_fox_safety_tests, "Fox website expiry, malformed data and planner safety tests", False),
         ("tou_schedule", run_tou_schedule_tests, "Shared TOU slot programme tests", False),
         ("deye_const", run_deye_const_tests, "DEYE constants tests", False),
         ("deye_config", run_deye_config_tests, "DEYE config/INVERTER_DEF tests", False),

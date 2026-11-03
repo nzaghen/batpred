@@ -1394,7 +1394,7 @@ On supported inverter and datalogger firmware, the v2 website's live energy-flow
 
 Live net battery and grid power also update the existing `invbatpower` and `meterpower` sensors used by Fox automatic configuration. Predbat therefore reads all available live flow inputs when it next reads inverter status, including when calculating a plan. Battery power is positive for discharge; Fox meter power is positive for import and is inverted by the existing `grid_power_invert` configuration. Missing, invalid or expired website fields fall back individually to OpenAPI, without mixing a live power direction with an old OpenAPI reading. No additional configuration or dependencies are needed. The planning schedule and dashboard refresh interval remain unchanged.
 
-V1 uses its legacy per-device status socket, reads detailed parameters and counters that match the existing Fox sensors, and reads battery SoC separately when needed. **V1 does not provide verified inverter sample age**; its regularly received values may still be delayed at the inverter/cloud reporting interval. It is an alternative website data source, with no five-second freshness guarantee.
+V1 uses its legacy per-device status socket, reads detailed status parameters that match the existing Fox sensors, and reads battery SoC separately when needed. Cumulative energy counters remain on OpenAPI for both website versions: switching counter sources could move a total backwards and distort energy history. **V1 does not provide verified inverter sample age**; its regularly received values may still be delayed at the inverter/cloud reporting interval. It is an alternative website data source, with no five-second freshness guarantee.
 
 The sensor `source` attribute identifies `fox_cloud` (v2), `fox_cloud_v1`, or `openapi`. Website readings also expose `website_version` and `sample_age_known`. OpenAPI continues polling the complete status at its normal intervals, and remains the fallback for missing website fields. Inverter settings and commands continue using OpenAPI.
 
@@ -1414,6 +1414,8 @@ Website authentication happens once when starting each connection, including the
 
 If v2 login or status fails, Predbat immediately tries v1. If v1 also fails, it uses its last successful OpenAPI readings and retries the websites with increasing delays of up to five minutes. Losing an active website feed requests an OpenAPI refresh on the next polling cycle. Repeated website login failures keep the normal OpenAPI polling interval. V2 readings expire when their inverter age reaches 30 seconds; either website connection is rejected if status stops arriving for 30 seconds. Reconnection starts with v2 again. No website credentials means the existing OpenAPI behaviour is unchanged.
 
+Website readings publish a `valid_until` attribute (UTC Unix timestamp). For live-enabled installations, Predbat checks its configured Fox SoC and power inputs before reading inverter status and again before executing a plan. Expired website readings, missing inputs, invalid numbers or units suspend new planning and execution rather than becoming zero or being treated as current. Fresh website data or valid OpenAPI fallback readings release the check automatically. This does not change the existing age policy for cached OpenAPI readings. The inverter keeps its previously installed schedule during suspension; that schedule may still charge or discharge. This safeguard cannot verify whether Fox itself is supplying incorrect but otherwise valid readings.
+
 Failures and recovery appear in the normal Predbat log, for example:
 
 ```text
@@ -1425,7 +1427,7 @@ Fox: v2 website status active for SERIAL (live flow)
 
 Logs identify the version, failed stage, HTTP status or API error code where available, and the next fallback. Tokens, passwords and arbitrary server messages are excluded.
 
-The v2 feed reports a whole plant, so use website status for single-inverter plants. Predbat skips the website readers when multiple discovered inverters share a plant; filtering a multi-inverter plant down to one inverter does not make its aggregate readings suitable. Firmware and connection requirements are listed in [Fox ESS's live energy-flow documentation](https://fox-ess.tech/5-second-live-energy-flow-available-on-foxcloud-for-selected-devices/). Both website protocols are unofficial and may change.
+The v2 feed reports a whole plant, so use website status for single-inverter plants. Predbat checks plant membership against the unfiltered device inventory and skips the website readers when multiple inverters share a plant; filtering a multi-inverter plant down to one inverter does not make its aggregate readings suitable. A complete inventory must be fetched after startup before website readers can start. Incomplete pages or unknown plant membership leave OpenAPI in use. Firmware and connection requirements are listed in [Fox ESS's live energy-flow documentation](https://fox-ess.tech/5-second-live-energy-flow-available-on-foxcloud-for-selected-devices/). Both website protocols are unofficial and may change.
 
 ---
 
