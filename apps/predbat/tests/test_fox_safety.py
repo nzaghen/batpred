@@ -323,6 +323,87 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         await self.fox.start_cloud_streams()
         self.assertEqual(self.fox.cloud_streams, {})
 
+    async def test_v1_portal_device_ids_reach_socket_and_battery_request(self):
+        """Use the actual list response fields, not the detail route's renamed fields."""
+        self.stream.v1_request = AsyncMock(
+            side_effect=[
+                {"devices": [{"deviceSN": "OTHER", "deviceID": "wrong-device"}, {"deviceSN": "SN1", "deviceID": "device1", "emsID": "ems1", "wifiMeterID": "meter1"}]},
+                {"batterys": [{"soc": 23}]},
+            ]
+        )
+        frame = MagicMock(type=aiohttp.WSMsgType.TEXT)
+        frame.json.return_value = {"msgType": "data", "sequence": "flow", "data": {"loadsPower": {"value": 1.2}}}
+        socket = MagicMock()
+        socket.send_json = AsyncMock()
+        socket.send_str = AsyncMock()
+        socket.receive = AsyncMock(side_effect=[frame, MagicMock(type=aiohttp.WSMsgType.CLOSED)])
+        session = MagicMock()
+        session.ws_connect.return_value = context(socket)
+        with self.assertRaises(ConnectionError):
+            await self.stream.listen_v1(session, "private-token")
+        for call in socket.send_json.await_args_list:
+            self.assertEqual(call.args[0]["parameters"], {"deviceID": "device1", "wifiMeterID": "meter1", "chargersSN": [], "emsID": "ems1"})
+        self.stream.v1_request.assert_awaited_with(session, "private-token", "/generic/v0/device/battery/info", {"id": "device1"})
+        self.assertEqual(self.stream.current_values()["SoC"]["value"], 23)
+
+    async def test_v1_duplicate_portal_serials_cannot_bind_an_arbitrary_device(self):
+        """Correct identifier spelling must not weaken exact serial matching."""
+        self.stream.v1_request = AsyncMock(return_value={"devices": [{"deviceSN": "SN1", "deviceID": "one"}, {"deviceSN": "SN1", "deviceID": "two"}]})
+        session = MagicMock()
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            await self.stream.listen_v1(session, "private-token")
+        session.ws_connect.assert_not_called()
+
+    async def test_healthy_v2_push_does_not_restart_subscription_every_twenty_seconds(self):
+        """Portal-style idle keepalive leaves regular push frames uninterrupted."""
+        self.fox.publish_cloud_data = AsyncMock()
+        frames = iter(range(105, 166, 5))
+
+        async def receive():
+            """Provide a minute of regular server pushes, followed by socket closure."""
+            tick = next(frames, None)
+            if tick is None:
+                return MagicMock(type=aiohttp.WSMsgType.CLOSED)
+            self.monotonic = tick
+            frame = MagicMock(type=aiohttp.WSMsgType.TEXT)
+            frame.json.return_value = live_frame()
+            return frame
+
+        socket = MagicMock()
+        socket.send_str = AsyncMock()
+        socket.receive = receive
+        session = MagicMock()
+        session.ws_connect.return_value = context(socket)
+        with self.assertRaises(ConnectionError):
+            await self.stream.listen(session, "private-token")
+        socket.send_str.assert_awaited_once_with("getdata")
+        self.assertEqual(self.fox.publish_cloud_data.await_count, 13)
+
+    async def test_v2_expiry_logs_numeric_frame_diagnostics_without_server_text(self):
+        """Distinguish rejected frames from silence without exposing server payloads."""
+        frame = MagicMock(type=aiohttp.WSMsgType.TEXT)
+        frame.json.return_value = {"errno": 41819, "result": {"timeDiff": 300}, "msg": "private-token"}
+        replies = iter([frame])
+
+        async def receive():
+            """Expire after one rejected frame without waiting in real time."""
+            reply = next(replies, None)
+            if reply is not None:
+                return reply
+            self.monotonic += 31
+            raise asyncio.TimeoutError()
+
+        socket = MagicMock()
+        socket.send_str = AsyncMock()
+        socket.receive = receive
+        session = MagicMock()
+        session.ws_connect.return_value = context(socket)
+        with self.assertRaises(asyncio.TimeoutError):
+            await self.stream.listen(session, "private-token")
+        logs = str(self.fox.log_messages)
+        self.assertIn("errno=41819.0, timeDiff=300.0s", logs)
+        self.assertNotIn("private-token", logs)
+
 
 def run_fox_safety_tests(my_predbat):
     """Run website failure-injection tests through Predbat's normal test harness."""

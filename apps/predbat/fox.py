@@ -373,14 +373,18 @@ class FoxCloudStream:
         async with session.ws_connect(url, heartbeat=20, timeout=aiohttp.ClientWSTimeout(ws_close=5), max_msg_size=1024 * 1024) as socket:
             await socket.send_str("getdata")
             deadline = time.monotonic() + FOX_CLOUD_MAX_AGE
-            next_request = time.monotonic() + 20
+            # The portal requests data after 30 seconds without a JSON message,
+            # rather than repeatedly restarting a healthy server push stream.
+            next_request = time.monotonic() + 30
+            last_age = last_errno = None
             while True:
                 now = time.monotonic()
                 if now >= deadline:
+                    self.owner.log(f"Warn: Fox: v2 website freshness deadline reached for {self.device_sn} (last frame errno={last_errno}, timeDiff={last_age}s)")
                     raise asyncio.TimeoutError("No fresh website readings")
                 if now >= next_request:
                     await socket.send_str("getdata")
-                    next_request = now + 20
+                    next_request = now + 30
                 try:
                     message = await asyncio.wait_for(socket.receive(), timeout=min(deadline, next_request) - now)
                 except asyncio.TimeoutError:
@@ -395,6 +399,10 @@ class FoxCloudStream:
                     data = message.json()
                 except (ValueError, TypeError):
                     continue
+                next_request = time.monotonic() + 30
+                last_errno = fox_cloud_number(data.get("errno")) if isinstance(data, dict) else None
+                result = data.get("result") if isinstance(data, dict) else None
+                last_age = fox_cloud_number(result.get("timeDiff")) if isinstance(result, dict) else None
                 values, age = fox_cloud_values(data)
                 if not values:
                     continue
@@ -418,11 +426,14 @@ class FoxCloudStream:
         """Subscribe to the legacy per-device socket and supplement its battery SoC."""
         result = await self.v1_request(session, token, "/generic/v0/device/list", {"currentPage": 1, "pageSize": 100, "condition": {"deviceSN": self.device_sn}}, post=True)
         devices = result.get("devices", [])
-        matches = [device for device in devices if isinstance(device, dict) and device.get("deviceSN") == self.device_sn and device.get("id")]
+        # The list response uses deviceID/emsID. The portal renames these to
+        # id/emsId only when constructing its detail-page route parameters.
+        matches = [device for device in devices if isinstance(device, dict) and device.get("deviceSN") == self.device_sn and (device.get("deviceID") or device.get("id"))]
         if len(matches) != 1:
             raise FoxCloudError("device lookup did not identify exactly one matching serial number")
         device = matches[0]
-        parameters = {"deviceID": device["id"], "wifiMeterID": device.get("wifiMeterID", ""), "chargersSN": [], "emsID": device.get("emsId", "")}
+        device_id = device.get("deviceID") or device["id"]
+        parameters = {"deviceID": device_id, "wifiMeterID": device.get("wifiMeterID", ""), "chargersSN": [], "emsID": device.get("emsID", device.get("emsId", ""))}
         url = FOX_DOMAIN.replace("https://", "wss://") + FOX_CLOUD_V1_WS_PATH
         async with session.ws_connect(url, heartbeat=20, timeout=aiohttp.ClientWSTimeout(ws_close=5), max_msg_size=1024 * 1024) as socket:
             for sequence, resource in [("flowDetail", "/c/v0/device/real/all"), ("flow", "/c/v0/device/real/flow")]:
@@ -453,7 +464,7 @@ class FoxCloudStream:
                 entries.update({key: (item, received_at + FOX_CLOUD_MAX_AGE) for key, item in values.items()})
                 has_recent_soc = any(key.casefold() == "soc" and time.monotonic() + 10 < expiry for key, (item, expiry) in entries.items())
                 if not any(key.casefold() == "soc" for key in values) and not has_recent_soc and self.owner.device_detail.get(self.device_sn, {}).get("hasBattery") and time.monotonic() >= next_battery:
-                    battery = await asyncio.wait_for(self.v1_request(session, token, "/generic/v0/device/battery/info", {"id": device["id"]}), timeout=max(0, deadline - time.monotonic()))
+                    battery = await asyncio.wait_for(self.v1_request(session, token, "/generic/v0/device/battery/info", {"id": device_id}), timeout=max(0, deadline - time.monotonic()))
                     packs = battery.get("batterys", [])
                     socs = [fox_cloud_number(pack.get("soc")) for pack in packs if isinstance(pack, dict)]
                     if socs and all(soc is not None and 0 <= soc <= 100 for soc in socs):
