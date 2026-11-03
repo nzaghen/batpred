@@ -86,6 +86,13 @@ Pull the non-default list first: `combine_export_slots`, `metric_min_improvement
 
 Grep for the named symbol rather than trusting a line number. Each area lists durable facts and "look here first" pointers, one per bullet.
 
+### Fox website realtime (downstream fork)
+
+| Area | What past debugging found | Targeted test |
+| --- | --- | --- |
+| Fox website live status (`fox.py`) | Verified against the v2 portal scripts on 2026-11-03: `/dew/v0/wsmaitian` is a **plant-wide** stream and `result.node.bat.soc` carries live SoC. `timeDiff` is the inverter sample age in seconds; cached frames must not renew freshness. Power objects carry their own W/kW units. The website defines grid direction `gridStatus` 1=export, 2=import (3 means on-grid, not importing). Energy counters remain on the normal reporting interval; see [Fox ESS live-flow documentation](https://fox-ess.tech/5-second-live-energy-flow-available-on-foxcloud-for-selected-devices/). Keep live values separate from the OpenAPI cache so delayed polls cannot overwrite fresh SoC, and fallback cannot reuse a live value after expiry. | `fox_realtime` |
+| Fox v1 website fallback (`fox.py`) | Verified against the legacy portal scripts on 2026-11-03: `/c/v0/user/login` uses MD5 password and `accountType` phone/email; its signing WASM is byte-identical to v2 on this date. `/c/v0/websocket` takes JSON subscriptions to `/c/v0/device/real/all` (blocks of values) and `/c/v0/device/real/flow` (power objects). Resolve the website device ID by an exact serial match from `/generic/v0/device/list`; it is not the OpenAPI serial itself. Battery info uses the literal `batterys` response key. V1 has no verified inverter sample-age field: do not advertise its receive cadence as five-second inverter freshness. | `fox_realtime` |
+
 ### Fox (`fox.py`)
 
 - Cloud errno 42015/44096 = setting unsupported by the device (`FOX_SETTINGS_UNSUPPORTED_ERRNO`); it is marked unavailable and never polled or written again. WorkMode is a select, ExportLimit a number. Since PR #5840 (2026-10-30) the three unsupported-setting lines log at Info (the same errno from a non-setting endpoint still warns); a Warn form in an attached log just dates it to pre-#5840.

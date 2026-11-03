@@ -25,6 +25,8 @@ import aiohttp
 import json
 import argparse
 import random
+import math
+from urllib.parse import urlencode
 from component_base import ComponentBase
 from coordinator import inverter_record
 from mock_base import MockBase
@@ -89,6 +91,364 @@ FOX_REFRESH_STATIC = 24 * 60  # Device list, detail and battery charge times rar
 FOX_REFRESH_SETTINGS = 60  # Device settings and scheduler
 FOX_REFRESH_PRODUCTION = 15  # Monthly production totals
 FOX_REFRESH_REALTIME = 5  # Real time monitoring data
+
+# The website's live energy-flow socket is separate from OpenAPI telemetry. Never
+# promote its cached/keepalive frames to current readings, even while connected.
+FOX_CLOUD_MAX_AGE = 30
+FOX_CLOUD_LOGIN_PATH = "/basic/v0/user/login"
+FOX_CLOUD_WS_PATH = "/dew/v0/wsmaitian"
+FOX_CLOUD_V1_LOGIN_PATH = "/c/v0/user/login"
+FOX_CLOUD_V1_WS_PATH = "/c/v0/websocket"
+
+
+def fox_cloud_headers(path, timestamp, local_tz, token="", version="v2"):
+    """Sign a website login request using the v2 portal's signature format.
+
+    Verified against /v2/js/signature.wasm (2026-11-03): literal backslash-r/n
+    separators, language before timestamp, and the fixed .5245784 suffix. Keep
+    this separate from the OpenAPI signature and its API key/OAuth credentials.
+    """
+    signature = hashlib.md5(rf"{path}\r\n{token}\r\n{FOX_LANG}\r\n{timestamp}".encode("utf-8")).hexdigest() + ".5245784"
+    now = datetime.fromtimestamp(int(timestamp) / 1000, local_tz).strftime("%Y-%m-%d %H:%M:%S")
+    headers = {
+        "Content-Type": "application/json",
+        "lang": FOX_LANG,
+        "token": token,
+        "timestamp": str(timestamp),
+        "signature": signature,
+        "timezone": str(local_tz),
+        "dt": f"{local_tz}@{timestamp}@{now}",
+        "platform": "web",
+    }
+    if version == "v2":
+        headers["X-Auth-Platform"] = "FOX_CLOUD_WEB_2_0"
+    return headers
+
+
+def fox_cloud_number(value):
+    """Return a finite telemetry number, rejecting booleans and placeholders."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def fox_cloud_power(node):
+    """Read a visible flow node's power in kW, respecting its supplied unit."""
+    if not isinstance(node, dict) or node.get("display") is False:
+        return None
+    power = node.get("power")
+    if not isinstance(power, dict) or power.get("display") is False:
+        return None
+    value = fox_cloud_number(power.get("value"))
+    unit = power.get("unit", "W")
+    if value is None or unit not in ("W", "kW"):
+        return None
+    return value / 1000.0 if unit == "W" else value
+
+
+def fox_cloud_values(message):
+    """Map fresh website flow readings to existing Fox sensor variable names.
+
+    Energy counters and detailed telemetry are deliberately left to OpenAPI:
+    the five-second socket does not carry those readings. The feed is per plant,
+    so callers must only bind it to a single inverter in that plant.
+    """
+    if not isinstance(message, dict) or message.get("errno") != 0:
+        return {}, None
+    result = message.get("result")
+    if not isinstance(result, dict):
+        return {}, None
+    age = fox_cloud_number(result.get("timeDiff"))
+    node = result.get("node")
+    if age is None or not 0 <= age < FOX_CLOUD_MAX_AGE or not isinstance(node, dict):
+        return {}, None
+    values = {}
+    bat = node.get("bat")
+    if isinstance(bat, dict) and bat.get("display") is not False:
+        soc = fox_cloud_number(bat.get("soc"))
+        if soc is not None and 0 <= soc <= 100 and bat.get("socDisplay") is not False:
+            values["SoC"] = {"value": soc, "name": "SoC", "unit": "%"}
+        power = fox_cloud_power(bat)
+        direction = str(bat.get("charge", ""))
+        if power is not None and power >= 0 and direction in ("1", "2"):
+            values["batChargePower"] = {"value": power if direction == "1" else 0.0, "name": "Charge Power", "unit": "kW"}
+            values["batDischargePower"] = {"value": power if direction == "2" else 0.0, "name": "Discharge Power", "unit": "kW"}
+    for key, variable, name in [("solar", "pvPower", "PV Power"), ("load", "loadsPower", "Load Power")]:
+        power = fox_cloud_power(node.get(key))
+        if power is not None and power >= 0:
+            values[variable] = {"value": power, "name": name, "unit": "kW"}
+    grid = node.get("grid")
+    power = fox_cloud_power(grid)
+    # The v2 website defines 1=exporting, 2=importing, 3=on-grid, 4=off-grid.
+    # An unknown direction must not turn into a fabricated import/export value.
+    direction = str(grid.get("gridStatus", "")) if isinstance(grid, dict) else ""
+    if power is not None and power >= 0 and direction in ("1", "2"):
+        values["gridConsumptionPower"] = {"value": power if direction == "2" else 0.0, "name": "Grid Consumption Power", "unit": "kW"}
+        values["feedinPower"] = {"value": power if direction == "1" else 0.0, "name": "Feed-in Power", "unit": "kW"}
+    for item in values.values():
+        item.update({"timestamp": result.get("lastUpdateDate", ""), "source": "fox_cloud"})
+    return values, age
+
+
+class FoxCloudError(ValueError):
+    """A website failure containing only a controlled, credential-free reason."""
+
+
+def fox_cloud_failure(error):
+    """Describe a failure without exposing server messages or token-bearing URLs."""
+    if isinstance(error, FoxCloudError):
+        return str(error)
+    if isinstance(error, aiohttp.ClientResponseError):
+        return f"HTTP {error.status}"
+    if isinstance(error, asyncio.TimeoutError):
+        return "request timed out or status stream stopped updating"
+    return type(error).__name__
+
+
+def fox_v1_values(message, known_values):
+    """Map the v1 socket's detailed blocks and flow objects to Fox variables.
+
+    V1 has no verified inverter-age field. Receiving its cached telemetry is not
+    evidence of a five-second inverter sample; preserve that distinction in the
+    published source and metadata.
+    """
+    if not isinstance(message, dict) or message.get("msgType") != "data" or message.get("errno", 0) != 0:
+        return {}
+    data = message.get("data")
+    if not isinstance(data, dict):
+        return {}
+    values = {}
+    if message.get("sequence") == "flowDetail":
+        names = {key.casefold(): key for key in known_values}
+        names.update({item.get("name", key).casefold(): key for key, item in known_values.items()})
+        names.update({"soc": "SoC", "state of charge": "SoC"})
+        blocks = data.get("blocks", [])
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict) or not isinstance(block.get("values"), list):
+                continue
+            for item in block["values"]:
+                if not isinstance(item, dict) or not isinstance(item.get("variable"), str):
+                    continue
+                key = names.get(item["variable"].casefold())
+                value = fox_cloud_number(item.get("value"))
+                if key and value is not None and (key.casefold() != "soc" or 0 <= value <= 100):
+                    original = known_values.get(key, {})
+                    unit = item.get("unit", original.get("unit", "%" if key == "SoC" else ""))
+                    values[key] = {"value": value, "name": original.get("name", key), "unit": "°C" if unit == "℃" else unit}
+    elif message.get("sequence") == "flow":
+        for key in ("loadsPower", "generationPower", "feedinPower", "gridConsumptionPower", "epsPower"):
+            power = data.get(key)
+            if isinstance(power, dict):
+                value = fox_cloud_number(power.get("value"))
+                unit = power.get("unit", "kW")
+                if value is not None and value >= 0 and unit in ("W", "kW"):
+                    values[key] = {"value": value / 1000 if unit == "W" else value, "unit": "kW", "name": key}
+        battery = data.get("invBatPower")
+        if isinstance(battery, dict):
+            power = fox_cloud_number(battery.get("value"))
+            unit = battery.get("unit", "kW")
+            if power is not None and unit in ("W", "kW"):
+                power = power / 1000 if unit == "W" else power
+                values["batChargePower"] = {"value": max(-power, 0), "unit": "kW", "name": "Charge Power"}
+                values["batDischargePower"] = {"value": max(power, 0), "unit": "kW", "name": "Discharge Power"}
+        solar = data.get("pvPower")
+        if isinstance(solar, list) and solar:
+            powers = [fox_cloud_power({"power": {"value": item.get("value"), "unit": item.get("unit", "kW")}}) if isinstance(item, dict) else None for item in solar]
+            if all(power is not None and power >= 0 for power in powers):
+                values["pvPower"] = {"value": sum(powers), "unit": "kW", "name": "PV Power"}
+    for item in values.values():
+        item.update({"source": "fox_cloud_v1", "website_version": "v1", "sample_age_known": False, "timestamp": ""})
+    return values
+
+
+class FoxCloudStream:
+    """Optional read-only website stream, with bounded freshness and reconnects."""
+
+    def __init__(self, owner, device_sn, plant_id):
+        """Keep this stream's live values separate from the OpenAPI cache."""
+        self.owner = owner
+        self.device_sn = device_sn
+        self.plant_id = plant_id
+        self.values = {}
+        self.observed_values = {}
+        self.expires_at = 0
+        self.task = None
+        self.active_version = None
+        self.received_data = False
+
+    def current_values(self):
+        """Return only readings that are still fresh according to inverter age."""
+        return self.values if time.monotonic() < self.expires_at else {}
+
+    async def login(self, session, version="v2"):
+        """Use website credentials to obtain a token without touching OpenAPI auth."""
+        owner = self.owner
+        timestamp = str(int(time.time() * 1000))
+        path = FOX_CLOUD_LOGIN_PATH if version == "v2" else FOX_CLOUD_V1_LOGIN_PATH
+        headers = fox_cloud_headers(path, timestamp, owner.local_tz, version=version)
+        body = {"user": owner.cloud_username, "password": hashlib.md5(owner.cloud_password.encode("utf-8")).hexdigest(), "type": 1, "verification": 1}
+        if version == "v1":
+            body = {"user": body["user"], "password": body["password"], "accountType": "email" if "@" in owner.cloud_username else "phone"}
+        async with session.post(FOX_DOMAIN + path, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=20)) as response:
+            response.raise_for_status()
+            data = await response.json()
+        result = data.get("result") if isinstance(data, dict) else None
+        token = result.get("token") if isinstance(result, dict) else None
+        if not isinstance(data, dict) or data.get("errno") != 0 or not isinstance(token, str) or not token:
+            code = data.get("errno") if isinstance(data, dict) else None
+            reason = f"login rejected (errno={code})" if isinstance(code, int) and code else "login response missing token"
+            raise FoxCloudError(reason)
+        return token
+
+    async def accept_values(self, values, age, version):
+        """Publish a source transition once and retain its bounded status snapshot."""
+        for item in values.values():
+            item["website_version"] = version
+            item.setdefault("sample_age_known", version == "v2")
+        self.values = values
+        self.observed_values.update(values)
+        self.expires_at = time.monotonic() + FOX_CLOUD_MAX_AGE - age
+        self.received_data = True
+        if self.active_version != version:
+            detail = "live flow" if version == "v2" else "inverter sample age unavailable"
+            self.owner.log(f"Fox: {version} website status active for {self.device_sn} ({detail})")
+            self.active_version = version
+        await self.owner.publish_cloud_data(self.device_sn)
+
+    async def listen(self, session, token):
+        """Receive fresh flow frames; cached frames cannot extend the deadline."""
+        query = urlencode({"plantId": self.plant_id, "token": token, "platform": "web", "lang": FOX_LANG})
+        url = FOX_DOMAIN.replace("https://", "wss://") + FOX_CLOUD_WS_PATH + "?" + query
+        async with session.ws_connect(url, heartbeat=20, timeout=aiohttp.ClientWSTimeout(ws_close=5), max_msg_size=1024 * 1024) as socket:
+            await socket.send_str("getdata")
+            deadline = time.monotonic() + FOX_CLOUD_MAX_AGE
+            next_request = time.monotonic() + 20
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    raise asyncio.TimeoutError("No fresh website readings")
+                if now >= next_request:
+                    await socket.send_str("getdata")
+                    next_request = now + 20
+                try:
+                    message = await asyncio.wait_for(socket.receive(), timeout=min(deadline, next_request) - now)
+                except asyncio.TimeoutError:
+                    continue
+                if message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.ERROR):
+                    raise ConnectionError("Website stream closed")
+                if message.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                try:
+                    data = message.json()
+                except (ValueError, TypeError):
+                    continue
+                values, age = fox_cloud_values(data)
+                if not values:
+                    continue
+                await self.accept_values(values, age, "v2")
+                deadline = self.expires_at
+
+    async def v1_request(self, session, token, path, data, post=False):
+        """Read a signed v1 website endpoint using its own session token."""
+        headers = fox_cloud_headers(path, str(int(time.time() * 1000)), self.owner.local_tz, token=token, version="v1")
+        request = session.post(FOX_DOMAIN + path, headers=headers, json=data) if post else session.get(FOX_DOMAIN + path, headers=headers, params=data)
+        async with request as response:
+            response.raise_for_status()
+            reply = await response.json()
+        if not isinstance(reply, dict) or reply.get("errno") != 0 or not isinstance(reply.get("result"), dict):
+            code = reply.get("errno") if isinstance(reply, dict) else None
+            reason = f"status request rejected (errno={code})" if isinstance(code, int) and code else "invalid status response"
+            raise FoxCloudError(reason)
+        return reply["result"]
+
+    async def listen_v1(self, session, token):
+        """Subscribe to the legacy per-device socket and supplement its battery SoC."""
+        result = await self.v1_request(session, token, "/generic/v0/device/list", {"currentPage": 1, "pageSize": 100, "condition": {"deviceSN": self.device_sn}}, post=True)
+        devices = result.get("devices", [])
+        matches = [device for device in devices if isinstance(device, dict) and device.get("deviceSN") == self.device_sn and device.get("id")]
+        if len(matches) != 1:
+            raise FoxCloudError("device lookup did not identify exactly one matching serial number")
+        device = matches[0]
+        parameters = {"deviceID": device["id"], "wifiMeterID": device.get("wifiMeterID", ""), "chargersSN": [], "emsID": device.get("emsId", "")}
+        url = FOX_DOMAIN.replace("https://", "wss://") + FOX_CLOUD_V1_WS_PATH
+        async with session.ws_connect(url, heartbeat=20, timeout=aiohttp.ClientWSTimeout(ws_close=5), max_msg_size=1024 * 1024) as socket:
+            for sequence, resource in [("flowDetail", "/c/v0/device/real/all"), ("flow", "/c/v0/device/real/flow")]:
+                await socket.send_json({"token": token, "msgType": "request", "interval": 3000, "sequence": sequence, "parameters": parameters, "resource": resource, "lang": FOX_LANG})
+                await socket.send_str("\r\n")
+            deadline = time.monotonic() + FOX_CLOUD_MAX_AGE
+            entries = {}
+            next_battery = 0
+            while True:
+                message = await asyncio.wait_for(socket.receive(), timeout=max(0, deadline - time.monotonic()))
+                if message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.ERROR):
+                    raise ConnectionError("Website stream closed")
+                if time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError("No website readings")
+                if message.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                try:
+                    reply = message.json()
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(reply, dict) and reply.get("errno", 0) != 0:
+                    code = reply["errno"]
+                    raise FoxCloudError(f"socket rejected request (errno={code})" if isinstance(code, int) else "socket rejected request")
+                values = fox_v1_values(reply, self.owner.device_values.get(self.device_sn, {}))
+                if not values:
+                    continue
+                has_recent_soc = any(key.casefold() == "soc" and time.monotonic() + 10 < expiry for key, (item, expiry) in entries.items())
+                if not any(key.casefold() == "soc" for key in values) and not has_recent_soc and self.owner.device_detail.get(self.device_sn, {}).get("hasBattery") and time.monotonic() >= next_battery:
+                    battery = await self.v1_request(session, token, "/generic/v0/device/battery/info", {"id": device["id"]})
+                    packs = battery.get("batterys", [])
+                    socs = [fox_cloud_number(pack.get("soc")) for pack in packs if isinstance(pack, dict)]
+                    if socs and all(soc is not None and 0 <= soc <= 100 for soc in socs):
+                        values["SoC"] = {"value": sum(socs) / len(socs), "name": "SoC", "unit": "%", "source": "fox_cloud_v1", "sample_age_known": False}
+                    next_battery = time.monotonic() + 20
+                # The two subscriptions arrive separately; keep fields only for
+                # 30 seconds since their own last update. Flow-only keepalive frames
+                # must not extend the lifetime of absent detailed readings.
+                now = time.monotonic()
+                entries.update({key: (item, now + FOX_CLOUD_MAX_AGE) for key, item in values.items()})
+                combined = {key: item for key, (item, expiry) in entries.items() if now < expiry}
+                await self.accept_values(combined, 0, "v1")
+                self.expires_at = min(expiry for key, (item, expiry) in entries.items() if key in combined)
+                deadline = self.expires_at
+
+    async def run(self):
+        """Reconnect independently so website failures never stop OpenAPI polling."""
+        delay = 30
+        while True:
+            for version in ("v2", "v1"):
+                stage = "login"
+                self.received_data = False
+                try:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+                        token = await self.login(session, version=version)
+                        stage = "status stream"
+                        if version == "v2":
+                            await self.listen(session, token)
+                        else:
+                            await self.listen_v1(session, token)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    if self.received_data:
+                        delay = 30
+                    fallback = "trying v1 website" if version == "v2" else f"using OpenAPI, retry websites in {delay}s"
+                    self.owner.log(f"Warn: Fox: {version} website failed for {self.device_sn} ({stage}: {fox_cloud_failure(error)}); {fallback}")
+                finally:
+                    had_live_data = bool(self.values)
+                    self.values = {}
+                    self.expires_at = 0
+                    self.active_version = None
+                    await self.owner.publish_cloud_data(self.device_sn, refresh=had_live_data)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)
+
 
 # Fox productType codes that must use the v2/v3 scheduler API. Fox's v1 scheduler
 # endpoints return errno 41200 permanently for these (EVO series) even though the
@@ -388,11 +748,18 @@ def groups_to_v3(groups, extra_extra_param=None):
 class FoxAPI(ComponentBase, OAuthMixin):
     """Fox API client."""
 
-    def initialize(self, key, automatic, automatic_ignore_pv=False, inverter_sn=None, auth_method=None, token_expires_at=None, token_hash=None):
+    def initialize(self, key, automatic, automatic_ignore_pv=False, inverter_sn=None, auth_method=None, token_expires_at=None, token_hash=None, cloud_username=None, cloud_password=None, poll_seconds=FOX_REFRESH_REALTIME * 60):
         """Initialise the Fox API component"""
         self.key = key
         self.automatic = automatic
         self.automatic_ignore_pv = automatic_ignore_pv
+        # ComponentBase runs once a minute. Round up so polling cannot happen
+        # more frequently than requested, independently of the website streams.
+        requested_poll = fox_cloud_number(poll_seconds)
+        if requested_poll is None:
+            requested_poll = FOX_REFRESH_REALTIME * 60
+        self.poll_seconds = max(60, math.ceil(requested_poll / 60) * 60)
+        self.log(f"Fox: OpenAPI status polling every {self.poll_seconds}s; website streams update independently")
         self.failures_total = 0
         self.device_list = []
         self.device_detail = {}
@@ -429,6 +796,11 @@ class FoxAPI(ComponentBase, OAuthMixin):
         self.rate_limit_errors_today = 0
         self.start_time_today = None
         self.last_midnight_utc = None
+        self.cloud_username = cloud_username
+        self.cloud_password = cloud_password
+        self.cloud_streams = {}
+        if bool(cloud_username) != bool(cloud_password):
+            self.log("Warn: Fox: Both fox_cloud_username and fox_cloud_password are required for live status; using OpenAPI")
 
         # Initialise OAuth support
         self._init_oauth(auth_method, key, token_expires_at, "fox_ess")
@@ -597,7 +969,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
                 await self._save_cache("device_production_month", self.device_production_month)
 
         # Real time monitoring data - refresh based on age
-        realtime_refresh = self._needs_refresh("device_values", FOX_REFRESH_REALTIME)
+        realtime_refresh = self._needs_refresh("device_values", getattr(self, "poll_seconds", FOX_REFRESH_REALTIME * 60) / 60.0)
         if realtime_refresh:
             realtime_updated = False
             for device in self.device_list:
@@ -612,6 +984,8 @@ class FoxAPI(ComponentBase, OAuthMixin):
         # Publish to HA whenever we have refreshed data (or on first start to populate entities)
         if first or settings_refresh or production_refresh or realtime_refresh:
             await self.publish_data()
+
+        await self.start_cloud_streams()
 
         # Unconditional, once per cycle and outside any one-shot gate, so a transient failure is
         # retried rather than lost - see ComponentBase.refresh_discovery(), which owns the
@@ -630,6 +1004,46 @@ class FoxAPI(ComponentBase, OAuthMixin):
             await self.automatic_config()
 
         return True
+
+    async def start_cloud_streams(self):
+        """Start one live stream per unambiguous single-inverter plant."""
+        if not getattr(self, "cloud_username", None) or not getattr(self, "cloud_password", None):
+            return
+        plants = {}
+        for device in self.device_list:
+            sn = device.get("deviceSN")
+            plant = self.device_detail.get(sn, {}).get("stationID")
+            if sn and plant:
+                plants.setdefault(str(plant), []).append(sn)
+        eligible = {sns[0]: plant for plant, sns in plants.items() if len(sns) == 1}
+        for sn, stream in list(self.cloud_streams.items()):
+            if eligible.get(sn) != stream.plant_id or stream.task.done():
+                stream.task.cancel()
+                await asyncio.gather(stream.task, return_exceptions=True)
+                del self.cloud_streams[sn]
+        for sn, plant in eligible.items():
+            if sn not in self.cloud_streams:
+                stream = FoxCloudStream(self, sn, plant)
+                self.cloud_streams[sn] = stream
+                stream.task = asyncio.create_task(stream.run())
+
+    async def publish_cloud_data(self, device_sn, refresh=False):
+        """Publish live readings immediately, reverting to OpenAPI on feed failure."""
+        if refresh:
+            # Schedule an OpenAPI refresh on the next normal poll as well as
+            # immediately republishing its last successful snapshot below. A
+            # repeated login failure must not increase normal OpenAPI usage.
+            self.data_age.pop("device_values", None)
+        await self.publish_data(live_only=True)
+
+    async def final(self):
+        """Cancel live readers and close their sockets/sessions during shutdown."""
+        streams = getattr(self, "cloud_streams", {})
+        tasks = [stream.task for stream in streams.values() if stream.task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        streams.clear()
 
     def _data_age_minutes(self, key):
         """
@@ -1898,16 +2312,20 @@ class FoxAPI(ComponentBase, OAuthMixin):
             record_api_call("fox", False, "server_error")
         return None, False
 
-    async def publish_data(self):
+    async def publish_data(self, live_only=False):
         """
         Publish data to HA using dashboard_item
         """
+
+        # Keep the persisted OpenAPI snapshot intact so fallback never reuses
+        # live values, and delayed per-battery SoCs cannot replace a live SoC.
+        device_values = {sn: values.copy() for sn, values in self.device_values.items()}
 
         # Create entity name prefix
         entity_name_sensor = f"sensor.{self.prefix}_fox"
         entity_name_number = f"number.{self.prefix}_fox"
         entity_name_select = f"select.{self.prefix}_fox"
-        for device in self.device_list:
+        for device in [] if live_only else self.device_list:
             sn = device.get("deviceSN", None)
             detail = self.device_detail.get(sn, {})
             hasPV = detail.get("hasPV", False)
@@ -1935,7 +2353,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
             reserve_min = int(self.fdsoc_min.get(sn, 10))
             self.dashboard_item(entity_name_sensor + "_" + sn.lower() + "_battery_reserve_min", state=reserve_min, attributes={"friendly_name": f"Fox {sn} Battery Reserve Min", "unit_of_measurement": "%"}, app="fox")
 
-            soh_raw = self.device_values.get(sn, {}).get("SOH", {}).get("value", 100.0)
+            soh_raw = device_values.get(sn, {}).get("SOH", {}).get("value", 100.0)
             try:
                 soh_fraction = round(float(soh_raw) / 100.0, 4)
             except (ValueError, TypeError):
@@ -1948,12 +2366,12 @@ class FoxAPI(ComponentBase, OAuthMixin):
             )
 
         # If we have soc_x sensors then sum them for total soc and store as _soc so that Predbat gets a single SOC value
-        for sn in self.device_values:
+        for sn in device_values:
             soc_total = 0
             soc_total_count = 0
-            for item_name in self.device_values[sn]:
+            for item_name in device_values[sn]:
                 if item_name.lower().startswith("soc_"):
-                    item = self.device_values[sn][item_name]
+                    item = device_values[sn][item_name]
                     soc = item.get("value", None)
                     try:
                         soc = float(soc)
@@ -1964,16 +2382,38 @@ class FoxAPI(ComponentBase, OAuthMixin):
                         soc_total_count += 1
             if soc_total_count > 0:
                 # Remove the SOC dictionary key (any case) otherwise we might create a duplicate (different case)
-                for key in list(self.device_values[sn].keys()):
+                for key in list(device_values[sn].keys()):
                     if key.lower() == "soc":
-                        del self.device_values[sn][key]
+                        del device_values[sn][key]
                 # Add total SOC
-                self.device_values[sn]["SoC"] = {"name": "State of Charge Total", "unit": "%", "value": round(soc_total / soc_total_count, 0)}
+                device_values[sn]["SoC"] = {"name": "State of Charge Total", "unit": "%", "value": round(soc_total / soc_total_count, 0)}
+
+        cloud_variables = {}
+        for sn, stream in getattr(self, "cloud_streams", {}).items():
+            live = stream.current_values()
+            observed = {**stream.observed_values, **stream.values}
+            cloud_variables[sn] = {key.lower() for key in observed}
+            values = device_values.setdefault(sn, {})
+            for variable, item in observed.items():
+                if not any(key.lower() == variable.lower() for key in values):
+                    # A live-only field with no OpenAPI counterpart must become
+                    # unavailable on fallback, rather than stay falsely current.
+                    values[variable] = {**item, "value": None, "source": "openapi", "timestamp": ""}
+            if live:
+                for variable, item in live.items():
+                    for key in list(values):
+                        if key.lower() == variable.lower():
+                            del values[key]
+                    values[variable] = item
 
         # Publish device values
-        for sn in self.device_values:
-            for item_name in self.device_values[sn]:
-                item = self.device_values[sn][item_name]
+        for sn in device_values:
+            if live_only and not cloud_variables.get(sn):
+                continue
+            for item_name in device_values[sn]:
+                if live_only and item_name.lower() not in cloud_variables[sn]:
+                    continue
+                item = device_values[sn][item_name]
                 state = item.get("value", None)
                 name = item.get("name", item_name)
                 units = item.get("unit", "")
@@ -1981,7 +2421,12 @@ class FoxAPI(ComponentBase, OAuthMixin):
                 attributes = {
                     "unit_of_measurement": units,
                     "friendly_name": f"Fox {sn} {name}",
+                    "source": item.get("source", "openapi"),
+                    "timestamp": item.get("timestamp", ""),
                 }
+                if "website_version" in item:
+                    attributes["website_version"] = item["website_version"]
+                    attributes["sample_age_known"] = item.get("sample_age_known", False)
                 # Set device and state class
                 if units in ["kWh", "Wh"]:
                     attributes["device_class"] = "energy"
@@ -1998,8 +2443,9 @@ class FoxAPI(ComponentBase, OAuthMixin):
                 self.dashboard_item(entity_id, state=state, attributes=attributes, app="fox")
 
             # Publish battery flow sensor
-            charge_power = self.device_values.get(sn, {}).get("batChargePower", {}).get("value", 0)
-            discharge_power = self.device_values.get(sn, {}).get("batDischargePower", {}).get("value", 0)
+            charge_power = device_values.get(sn, {}).get("batChargePower", {}).get("value", 0)
+            discharge_power = device_values.get(sn, {}).get("batDischargePower", {}).get("value", 0)
+            battery_unavailable = charge_power is None and discharge_power is None
 
             try:
                 charge_power = float(charge_power) if charge_power is not None else 0.0
@@ -2009,7 +2455,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
                 discharge_power = 0.0
 
             # Calculate battery flow: positive = discharge, negative = charge
-            battery_flow = discharge_power - charge_power
+            battery_flow = None if battery_unavailable else discharge_power - charge_power
 
             self.dashboard_item(
                 entity_name_sensor + "_" + sn.lower() + "_battery_flow",
@@ -2019,9 +2465,10 @@ class FoxAPI(ComponentBase, OAuthMixin):
             )
 
             # Publish schedule settings
-            await self.publish_schedule_settings_ha(sn)
+            if not live_only:
+                await self.publish_schedule_settings_ha(sn)
 
-        for sn in self.device_settings:
+        for sn in [] if live_only else self.device_settings:
             # Device must have battery to publish settings
             if not self.device_detail.get(sn, {}).get("hasBattery", False):
                 continue
@@ -2055,7 +2502,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
                 self.dashboard_item(entity_id, state=state, attributes=attributes, app="fox")
 
         # Publish month and today totals
-        for sn in self.device_production_month:
+        for sn in [] if live_only else self.device_production_month:
             today = datetime.now(self.local_tz).day
 
             for item in self.device_production_month[sn]:

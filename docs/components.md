@@ -1372,8 +1372,58 @@ Integrates with Fox ESS inverters for monitoring and controlling Fox ESS battery
 | Option | Type | Required | Default | Config Key | Description |
 | ------ | ---- | -------- | ------- | ---------- | ----------- |
 | `key` | String | Yes | - | `fox_key` | Your Fox ESS API key |
+| `cloud_username` | String | No | unset | `fox_cloud_username` | Fox Cloud website username for optional live SoC and power readings |
+| `cloud_password` | String | No | unset | `fox_cloud_password` | Fox Cloud website password; configure both website credentials to enable live status |
+| `poll_seconds` | Integer | No | 300 | `fox_poll_seconds` | OpenAPI status poll interval in seconds; minimum 60, rounded up to whole minutes. Website streams update independently |
 | `automatic` | Boolean | No | false | `fox_automatic` | Set to `true` to automatically configured Predbat to use the Fox inverter (no manual `apps.yaml` updates required) |
 | `automatic_ignore_pv` | Boolean | No | false | `fox_automatic_ignore_pv` | When `automatic` is enabled, set to `true` to prevent Fox Cloud from overwriting `pv_power` and `pv_today` config. Useful for AC-coupled setups where PV is measured independently and Fox Cloud reports zero/absent PV data |
+
+#### Optional live status (fox)
+
+Add your Fox Cloud **website** credentials alongside the existing API key in `apps.yaml`:
+
+```yaml
+  fox_key: !secret fox_key
+  fox_cloud_username: !secret fox_cloud_username
+  fox_cloud_password: !secret fox_cloud_password
+```
+
+Predbat tries the **v2 website first, then the v1 website, then OpenAPI**. Both website versions use the credentials above, with separate login endpoints and status protocols. They currently share the same request-signing algorithm, so this does not protect against every Fox authentication change.
+
+On supported inverter and datalogger firmware, the v2 website's live energy-flow feed updates about every five seconds. Predbat uses it for battery SoC, battery charge/discharge power, PV power, house load power and grid import/export power. These update the existing Fox sensors immediately, so the next plan uses the latest battery SoC. V2 does **not** include detailed status or energy counters such as exported kWh.
+
+V1 uses its legacy per-device status socket, reads detailed parameters and counters that match the existing Fox sensors, and reads battery SoC separately when needed. **V1 does not provide verified inverter sample age**; its regularly received values may still be delayed at the inverter/cloud reporting interval. It is an alternative website data source, with no five-second freshness guarantee.
+
+The sensor `source` attribute identifies `fox_cloud` (v2), `fox_cloud_v1`, or `openapi`. Website readings also expose `website_version` and `sample_age_known`. OpenAPI continues polling the complete status at its normal intervals, and remains the fallback for missing website fields. Inverter settings and commands continue using OpenAPI.
+
+#### Polling and authentication (fox)
+
+The website readers keep their connections open: v2 publishes incoming live updates (typically every five seconds), while v1 requests a three-second subscription interval. V1's incoming values may still contain older inverter samples. Neither reader waits for the OpenAPI polling timer before updating sensors.
+
+OpenAPI status polling defaults to five minutes. To request it every two minutes, add:
+
+```yaml
+  fox_poll_seconds: 120
+```
+
+The minimum is 60 seconds; intervals are rounded up to whole minutes because the component checks its cache once a minute. This changes only the OpenAPI status refresh. Device settings still refresh hourly, monthly production data every 15 minutes, and static device information daily. Faster OpenAPI polling cannot make the inverter upload new data sooner. Fox documents a daily allowance of [1,440 API calls per inverter](https://ho0mrhk5pr.apifox.cn/8885010m0): one status request each minute alone consumes that allowance, before settings reads and commands. Two minutes leaves more room for other requests.
+
+Website authentication happens once when starting each connection, including the first connection after startup. The returned token is reused for all readings and supplementary v1 requests on that connection. A disconnect, expired/rejected session or stale stream triggers the fallback/reconnection process and another login, even if the previous token has not expired. Website tokens are held only in memory and are not reused across reconnects or restarts. There is no login per reading. OpenAPI uses its configured API key on each signed request; OAuth installations reuse and refresh their access token as needed.
+
+If v2 login or status fails, Predbat immediately tries v1. If v1 also fails, it uses its last successful OpenAPI readings and retries the websites with increasing delays of up to five minutes. Losing an active website feed requests an OpenAPI refresh on the next polling cycle. Repeated website login failures keep the normal OpenAPI polling interval. V2 readings expire when their inverter age reaches 30 seconds; either website connection is rejected if status stops arriving for 30 seconds. Reconnection starts with v2 again. No website credentials means the existing OpenAPI behaviour is unchanged.
+
+Failures and recovery appear in the normal Predbat log, for example:
+
+```text
+Warn: Fox: v2 website failed for SERIAL (login: HTTP 401); trying v1 website
+Fox: v1 website status active for SERIAL (inverter sample age unavailable)
+Warn: Fox: v1 website failed for SERIAL (status stream: ConnectionError); using OpenAPI, retry websites in 30s
+Fox: v2 website status active for SERIAL (live flow)
+```
+
+Logs identify the version, failed stage, HTTP status or API error code where available, and the next fallback. Tokens, passwords and arbitrary server messages are excluded.
+
+The v2 feed reports a whole plant, so use website status for single-inverter plants. Predbat skips the website readers when multiple discovered inverters share a plant; filtering a multi-inverter plant down to one inverter does not make its aggregate readings suitable. Firmware and connection requirements are listed in [Fox ESS's live energy-flow documentation](https://fox-ess.tech/5-second-live-energy-flow-available-on-foxcloud-for-selected-devices/). Both website protocols are unofficial and may change.
 
 ---
 

@@ -63,6 +63,7 @@ Batpred
 battemperature
 batteri
 batteryb
+batterys
 batusecap
 beforeunload
 bierner
@@ -274,6 +275,7 @@ geseriale
 getaffinity
 getall
 getattr
+getdata
 getmembers
 getrusage
 Ginlong
@@ -802,6 +804,7 @@ workstreams
 worktree
 writeonly
 wrongsha
+wsmaitian
 wwxxabcdefyyzz
 x1
 xaxis
