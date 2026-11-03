@@ -490,7 +490,11 @@ class TestFoxV1Fallback(unittest.IsolatedAsyncioTestCase):
 
         async def receive():
             """Deliver independently dated detailed and flow frames."""
-            clock[0], data = next(frames)
+            entry = next(frames, None)
+            if entry is None:
+                clock[0] = 161
+                raise asyncio.TimeoutError()
+            clock[0], data = entry
             message = MagicMock(type=aiohttp.WSMsgType.TEXT)
             message.json.return_value = data
             return message
@@ -505,7 +509,10 @@ class TestFoxV1Fallback(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.TimeoutError):
                 await stream.listen_v1(session, "token")
             self.assertEqual(stream.current_values(), {})
-        self.assertEqual(fox.publish_cloud_data.await_count, 2)
+        self.assertEqual(fox.publish_cloud_data.await_count, 3)
+        self.assertNotIn("SoC", stream.values)
+        self.assertEqual(stream.values["loadsPower"]["value"], 1.2)
+        self.assertIn("flow=2, flowDetail=1", str(fox.log_messages))
 
     async def test_v1_socket_uses_matched_device_and_reads_battery_soc(self):
         """Subscribe by website device ID and supplement the flow's missing SoC."""

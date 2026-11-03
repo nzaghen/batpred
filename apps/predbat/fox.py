@@ -97,12 +97,14 @@ FOX_REFRESH_REALTIME = 5  # Real time monitoring data
 # The website's live energy-flow socket is separate from OpenAPI telemetry. Never
 # promote its cached/keepalive frames to current readings, even while connected.
 FOX_CLOUD_MAX_AGE = 30
+FOX_CLOUD_RECOVERY_SECONDS = 120
 FOX_OPENAPI_MAX_AGE = 15 * 60
 FOX_PLANNER_FIELDS = {"soc_percent": "soc", "battery_power": "invbatpower", "grid_power": "meterpower", "pv_power": "pvpower", "load_power": "loadspower"}
 FOX_SIGNED_POWER_FIELDS = {"invbatpower", "meterpower", "meterpower2"}
 FOX_POWER_FIELDS = FOX_SIGNED_POWER_FIELDS | {field.casefold() for field in ("batChargePower", "batDischargePower", "gridConsumptionPower", "feedinPower", "pvPower", "loadsPower", "generationPower", "epsPower")}
 FOX_CLOUD_LOGIN_PATH = "/basic/v0/user/login"
 FOX_CLOUD_WS_PATH = "/dew/v0/wsmaitian"
+FOX_CLOUD_PREINFO_PATH = "/dew/w/plant/flow/preInfo"
 FOX_CLOUD_V1_LOGIN_PATH = "/c/v0/user/login"
 FOX_CLOUD_V1_WS_PATH = "/c/v0/websocket"
 
@@ -430,27 +432,41 @@ class FoxCloudStream:
         """Receive fresh flow frames; cached frames cannot extend the deadline."""
         query = urlencode({"plantId": self.plant_id, "token": token, "platform": "web", "lang": FOX_LANG})
         url = FOX_DOMAIN.replace("https://", "wss://") + FOX_CLOUD_WS_PATH + "?" + query
-        async with session.ws_connect(url, heartbeat=20, timeout=aiohttp.ClientWSTimeout(ws_close=5), max_msg_size=1024 * 1024) as socket:
+        async with session.ws_connect(url, timeout=aiohttp.ClientWSTimeout(ws_close=5), max_msg_size=1024 * 1024) as socket:
             await socket.send_str("getdata")
             deadline = time.monotonic() + FOX_CLOUD_MAX_AGE
-            # The portal requests data after 30 seconds without a JSON message,
-            # rather than repeatedly restarting a healthy server push stream.
+            recovery_deadline = deadline
+            # Match the portal's idle requests while keeping data expiry
+            # separate: the browser can recover on this socket after a gap.
             next_request = time.monotonic() + 30
+            requests_sent = 1
             last_age = last_errno = None
             while True:
                 now = time.monotonic()
-                if now >= deadline:
-                    self.owner.log(f"Warn: Fox: v2 website freshness deadline reached for {self.device_sn} (last frame errno={last_errno}, timeDiff={last_age}s)")
+                if now >= recovery_deadline:
+                    self.owner.log(f"Warn: Fox: v2 website freshness deadline reached for {self.device_sn} (last frame errno={last_errno}, timeDiff={last_age}s, getdata requests={requests_sent})")
                     raise asyncio.TimeoutError("No fresh website readings")
+                if now >= deadline and self.values:
+                    self.values = {}
+                    self.expires_at = 0
+                    self.active_version = None
+                    self.owner.log(f"Warn: Fox: v2 website readings expired for {self.device_sn}; using valid fallback while retaining socket for recovery")
+                    await self.owner.publish_cloud_data(self.device_sn, refresh=True)
+                    deadline = float("inf")
+                    continue
                 if now >= next_request:
                     await socket.send_str("getdata")
+                    requests_sent += 1
                     next_request = now + 30
+                wake_deadline = min(recovery_deadline, next_request, deadline if self.values else recovery_deadline)
                 try:
-                    message = await asyncio.wait_for(socket.receive(), timeout=min(deadline, next_request) - now)
+                    message = await asyncio.wait_for(socket.receive(), timeout=max(0, wake_deadline - now))
                 except asyncio.TimeoutError:
                     continue
-                if time.monotonic() >= deadline:
-                    raise asyncio.TimeoutError("Website frame arrived after its freshness deadline")
+                if time.monotonic() >= wake_deadline:
+                    # A callback that runs after its scheduled wake could have
+                    # been queued during an event-loop stall. Do not re-age it.
+                    raise asyncio.TimeoutError("Website frame arrived after its receive deadline")
                 if message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.ERROR):
                     raise ConnectionError("Website stream closed")
                 if message.type != aiohttp.WSMsgType.TEXT:
@@ -466,8 +482,38 @@ class FoxCloudStream:
                 values, age = fox_cloud_values(data)
                 if not values:
                     continue
+                received_at = time.monotonic()
                 await self.accept_values(values, age, "v2")
                 deadline = self.expires_at
+                recovery_deadline = received_at + FOX_CLOUD_RECOVERY_SECONDS
+
+    async def renew_v2_flow(self, session, token):
+        """Mirror the portal's initial and once-a-minute flow preparation request."""
+        while True:
+            started_at = time.monotonic()
+            try:
+                headers = fox_cloud_headers(FOX_CLOUD_PREINFO_PATH, str(int(time.time() * 1000)), self.owner.local_tz, token=token)
+                async with session.get(FOX_DOMAIN + FOX_CLOUD_PREINFO_PATH, headers=headers, params={"plantID": self.plant_id}, timeout=aiohttp.ClientTimeout(total=20)) as response:
+                    response.raise_for_status()
+                    reply = await response.json()
+                if not isinstance(reply, dict) or reply.get("errno") != 0:
+                    code = reply.get("errno") if isinstance(reply, dict) else None
+                    raise FoxCloudError(f"flow preparation rejected (errno={code})" if isinstance(code, int) else "invalid flow preparation response")
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.owner.log(f"Warn: Fox: v2 website flow preparation failed for {self.device_sn} ({fox_cloud_failure(error)}); retry in 60s")
+            # A successful HTTP request is not a fresh status sample.
+            await asyncio.sleep(max(1, 60 - (time.monotonic() - started_at)))
+
+    async def listen_with_renewal(self, session, token):
+        """Own and cancel the periodic HTTP task alongside the v2 socket reader."""
+        renewal = asyncio.create_task(self.renew_v2_flow(session, token))
+        try:
+            await self.listen_with_reconnect(session, token)
+        finally:
+            renewal.cancel()
+            await asyncio.gather(renewal, return_exceptions=True)
 
     async def v1_request(self, session, token, path, data, post=False):
         """Read a signed v1 website endpoint using its own session token."""
@@ -482,6 +528,31 @@ class FoxCloudStream:
             raise FoxCloudError(reason)
         return reply["result"]
 
+    async def listen_with_reconnect(self, session, token):
+        """Quickly reopen a previously healthy v2 stream without repeating login."""
+        received_any = False
+        while True:
+            self.received_data = False
+            started_at = time.monotonic()
+            try:
+                await self.listen(session, token)
+                return
+            except Exception as error:
+                received_any |= self.received_data
+                # An initial failure or a short failed reconnect must reach v1,
+                # not create a tight retry loop. A sustained recovery earns a
+                # new quick reconnect if the server later stops that stream.
+                if not self.received_data or time.monotonic() - started_at < 60:
+                    self.received_data = received_any
+                    raise
+                self.owner.log(f"Warn: Fox: v2 website stream interrupted for {self.device_sn} ({fox_cloud_failure(error)}); reconnecting with existing session before v1 fallback")
+                had_live_data = bool(self.values)
+                self.values = {}
+                self.expires_at = 0
+                self.active_version = None
+                await self.owner.publish_cloud_data(self.device_sn, refresh=had_live_data)
+                await asyncio.sleep(1)
+
     async def listen_v1(self, session, token):
         """Subscribe to the legacy per-device socket and supplement its battery SoC."""
         result = await self.v1_request(session, token, "/generic/v0/device/list", {"currentPage": 1, "pageSize": 100, "condition": {"deviceSN": self.device_sn}}, post=True)
@@ -495,15 +566,20 @@ class FoxCloudStream:
         device_id = device.get("deviceID") or device["id"]
         parameters = {"deviceID": device_id, "wifiMeterID": device.get("wifiMeterID", ""), "chargersSN": [], "emsID": device.get("emsID", device.get("emsId", ""))}
         url = FOX_DOMAIN.replace("https://", "wss://") + FOX_CLOUD_V1_WS_PATH
-        async with session.ws_connect(url, heartbeat=20, timeout=aiohttp.ClientWSTimeout(ws_close=5), max_msg_size=1024 * 1024) as socket:
+        async with session.ws_connect(url, timeout=aiohttp.ClientWSTimeout(ws_close=5), max_msg_size=1024 * 1024) as socket:
             for sequence, resource in [("flowDetail", "/c/v0/device/real/all"), ("flow", "/c/v0/device/real/flow")]:
                 await socket.send_json({"token": token, "msgType": "request", "interval": 3000, "sequence": sequence, "parameters": parameters, "resource": resource, "lang": FOX_LANG})
                 await socket.send_str("\r\n")
             deadline = time.monotonic() + FOX_CLOUD_MAX_AGE
             entries = {}
             next_battery = 0
+            frame_counts = {"flow": 0, "flowDetail": 0}
             while True:
-                message = await asyncio.wait_for(socket.receive(), timeout=max(0, deadline - time.monotonic()))
+                try:
+                    message = await asyncio.wait_for(socket.receive(), timeout=max(0, deadline - time.monotonic()))
+                except asyncio.TimeoutError:
+                    self.owner.log(f"Warn: Fox: v1 website has no usable updates for 30s for {self.device_sn} (data frames flow={frame_counts['flow']}, flowDetail={frame_counts['flowDetail']})")
+                    raise
                 if message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.ERROR):
                     raise ConnectionError("Website stream closed")
                 if time.monotonic() >= deadline:
@@ -517,6 +593,8 @@ class FoxCloudStream:
                 if isinstance(reply, dict) and reply.get("errno", 0) != 0:
                     code = reply["errno"]
                     raise FoxCloudError(f"socket rejected request (errno={code})" if isinstance(code, int) else "socket rejected request")
+                if isinstance(reply, dict) and reply.get("msgType") == "data" and reply.get("sequence") in frame_counts:
+                    frame_counts[reply["sequence"]] += 1
                 values = fox_v1_values(reply, self.owner.device_values.get(self.device_sn, {}))
                 if not values:
                     continue
@@ -535,12 +613,16 @@ class FoxCloudStream:
                 # 30 seconds since their own last update. Flow-only keepalive frames
                 # must not extend the lifetime of absent detailed readings.
                 now = time.monotonic()
+                entries = {key: (item, expiry) for key, (item, expiry) in entries.items() if now < expiry}
                 combined = {key: item for key, (item, expiry) in entries.items() if now < expiry}
                 if not combined or now >= deadline:
                     raise asyncio.TimeoutError("Website readings expired during battery request")
                 expires_at = min(expiry for key, (item, expiry) in entries.items() if key in combined)
                 await self.accept_values(combined, FOX_CLOUD_MAX_AGE - (expires_at - now), "v1")
-                deadline = self.expires_at
+                # Per-field validity must not become a transport deadline. A
+                # vanished detail field expires independently while new flow
+                # frames continue; it must neither stay fresh nor kill them.
+                deadline = received_at + FOX_CLOUD_MAX_AGE
 
     async def run(self):
         """Reconnect independently so website failures never stop OpenAPI polling."""
@@ -554,7 +636,7 @@ class FoxCloudStream:
                         token = await self.login(session, version=version)
                         stage = "status stream"
                         if version == "v2":
-                            await self.listen(session, token)
+                            await self.listen_with_renewal(session, token)
                         else:
                             await self.listen_v1(session, token)
                 except asyncio.CancelledError:

@@ -1,5 +1,5 @@
 """Failure-injection regressions for the optional Fox website data path."""
-# cspell:ignore reage
+# cspell:ignore reage battemp
 
 import asyncio
 from copy import deepcopy
@@ -513,6 +513,241 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         self.fox.base.entities = original
         self.stream.latest_samples["soc"] = self.wall + 1
         self.assertIsNotNone(self.fox.planner_data_error(0))
+
+    async def test_v2_silent_five_minute_feed_is_requested_before_expiry(self):
+        """A quiet stream can resume before recovery expiry while data expires independently."""
+        events = iter([(tick, "frame") for tick in range(100, 401, 5)] + [(425, "timeout"), (430, "timeout"), (431, "frame"), (432, "closed")])
+        publications = []
+
+        async def receive():
+            """Model five minutes of pushes, then wait for a fresh getdata request."""
+            tick, kind = next(events)
+            self.wall += tick - self.monotonic
+            self.monotonic = tick
+            if kind == "timeout":
+                raise asyncio.TimeoutError()
+            if kind == "closed":
+                return MagicMock(type=aiohttp.WSMsgType.CLOSED)
+            if tick == 431:
+                self.assertEqual(socket.send_str.await_count, 2)
+                self.assertFalse(self.stream.current_values())
+            frame = MagicMock(type=aiohttp.WSMsgType.TEXT)
+            frame.json.return_value = live_frame(soc=23)
+            return frame
+
+        async def publish(sn, refresh=False):
+            """Capture real publication metadata at each accepted sample."""
+            await self.fox.publish_data(live_only=True)
+            publications.append(deepcopy(self.fox.dashboard_items["sensor.predbat_fox_sn1_soc"]))
+
+        self.fox.publish_cloud_data = publish
+        socket = SimpleNamespace(send_str=AsyncMock(), receive=receive)
+        session = MagicMock()
+        session.ws_connect.return_value = context(socket)
+        with self.assertRaises(ConnectionError):
+            await self.stream.listen(session, "private-token")
+        self.assertEqual(len(publications), 63)
+        self.assertEqual(socket.send_str.await_count, 2)
+        self.assertIsNone(publications[61]["state"])
+        self.assertTrue(all(item["state"] == 23 and item["attributes"]["source"] == "fox_cloud" for item in publications[:61] + publications[62:]))
+
+    async def test_v2_getdata_without_response_cannot_renew_freshness(self):
+        """Sending requests never makes an old numeric SoC usable for planning."""
+        self.date_openapi(self.wall - 60)
+        events = iter([(100, "frame"), (125, "timeout"), (130, "timeout"), (160, "timeout"), (190, "timeout"), (220, "timeout")])
+
+        async def receive():
+            """Ignore the two renewal requests and stop at the original sample deadline."""
+            tick, kind = next(events)
+            self.wall += tick - self.monotonic
+            self.monotonic = tick
+            if kind == "timeout":
+                raise asyncio.TimeoutError()
+            frame = MagicMock(type=aiohttp.WSMsgType.TEXT)
+            frame.json.return_value = live_frame()
+            return frame
+
+        socket = SimpleNamespace(send_str=AsyncMock(), receive=receive)
+        session = MagicMock()
+        session.ws_connect.return_value = context(socket)
+        with self.assertRaises(asyncio.TimeoutError):
+            await self.stream.listen(session, "private-token")
+        self.sync_publication()
+        self.assertEqual(socket.send_str.await_count, 4)
+        self.assertEqual(self.stream.current_values(), {})
+        self.assertEqual(self.stream.expires_at, 0)
+        self.assertIn("suspended", self.fox.planner_data_error(0))
+        self.assertIn("getdata requests=4", str(self.fox.log_messages))
+
+    async def test_v1_expired_detail_field_does_not_kill_fresh_power(self):
+        """Expire missing detail independently without extending it through flow activity."""
+        self.fox.device_detail["SN1"]["hasBattery"] = False
+        self.stream.v1_request = AsyncMock(return_value={"devices": [{"deviceSN": "SN1", "deviceID": "device1"}]})
+        self.fox.device_values["SN1"]["batTemp"] = {"name": "Battery temperature", "value": 19, "unit": "°C"}
+        detail = {"msgType": "data", "sequence": "flowDetail", "data": {"blocks": [{"values": [{"variable": "batTemp", "value": 25, "unit": "°C"}]}]}}
+        flow = {"msgType": "data", "sequence": "flow", "data": {"loadsPower": {"value": 1.2}}}
+        events = iter([(100, detail), (120, flow), (131, flow), (150, flow), (151, None)])
+
+        async def receive():
+            """Continue delivering power beyond the initial detailed field's lifetime."""
+            tick, payload = next(events)
+            self.wall += tick - self.monotonic
+            self.monotonic = tick
+            if payload is None:
+                return MagicMock(type=aiohttp.WSMsgType.CLOSED)
+            frame = MagicMock(type=aiohttp.WSMsgType.TEXT)
+            frame.json.return_value = payload
+            return frame
+
+        socket = SimpleNamespace(send_str=AsyncMock(), send_json=AsyncMock(), receive=receive)
+        session = MagicMock()
+        session.ws_connect.return_value = context(socket)
+        with self.assertRaises(ConnectionError):
+            await self.stream.listen_v1(session, "private-token")
+        self.assertEqual(self.stream.current_values()["loadsPower"]["value"], 1.2)
+        self.assertNotIn("batTemp", self.stream.current_values())
+        self.assertEqual(self.fox.dashboard_items["sensor.predbat_fox_sn1_battemp"]["state"], 19)
+        self.assertEqual(self.fox.dashboard_items["sensor.predbat_fox_sn1_loadspower"]["attributes"]["source"], "fox_cloud_v1")
+
+    async def test_healthy_v2_reconnect_reuses_token_and_short_failure_reaches_fallback(self):
+        """One healthy stream can reopen quickly, but a failed resume must escape to v1."""
+        self.date_openapi(self.wall - 60)
+        self.stream.login = AsyncMock()
+        session = object()
+        attempts = []
+
+        async def listen(actual_session, token):
+            """Simulate two long-lived connections followed by an immediately failed resume."""
+            self.assertIs(actual_session, session)
+            self.assertEqual(token, "private-token")
+            attempts.append(len(attempts))
+            if len(attempts) < 3:
+                await self.publish_live(soc=23)
+                self.monotonic += 325
+                self.wall += 325
+                raise asyncio.TimeoutError("secret-server-url")
+            self.assertEqual(self.stream.values, {})
+            self.assertEqual(self.stream.expires_at, 0)
+            self.assertIsNone(self.fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"])
+            raise ConnectionError("secret-server-url")
+
+        self.stream.listen = listen
+        with patch("fox.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            with self.assertRaises(ConnectionError):
+                await self.stream.listen_with_reconnect(session, "private-token")
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleep.await_count, 2)
+        self.assertTrue(self.stream.received_data)
+        self.stream.login.assert_not_awaited()
+        self.assertNotIn("secret-server-url", str(self.fox.log_messages))
+        self.assertNotIn("private-token", str(self.fox.log_messages))
+
+    async def test_v2_reconnect_does_not_retry_an_initial_failure_or_cancellation(self):
+        """No data and cancellation must not be hidden behind repeated transport retries."""
+        for error in (ConnectionError(), asyncio.CancelledError()):
+            self.stream.listen = AsyncMock(side_effect=error)
+            with patch("fox.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                with self.assertRaises(type(error)):
+                    await self.stream.listen_with_reconnect(object(), "private-token")
+                sleep.assert_not_awaited()
+            self.stream.listen.assert_awaited_once()
+
+    async def test_browser_capture_stale_frames_recover_on_same_socket(self):
+        """Replay the observed 88-second browser gap without accepting its cached SoC frames."""
+        self.date_openapi(self.wall - 60)
+        events = iter([(100, 5), (125, None), (130, None), (131.57, 61), (161.57, None), (164.27, 64), (188.29, 5), (190, "closed")])
+        states = []
+
+        async def receive():
+            """Use the capture's receive gaps and portal idle-request timing."""
+            tick, age = next(events)
+            self.wall += tick - self.monotonic
+            self.monotonic = tick
+            if age is None:
+                raise asyncio.TimeoutError()
+            if age == "closed":
+                return MagicMock(type=aiohttp.WSMsgType.CLOSED)
+            frame = MagicMock(type=aiohttp.WSMsgType.TEXT)
+            frame.json.return_value = live_frame(soc=99 if age > 30 else 23, age=age)
+            return frame
+
+        async def publish(sn, refresh=False):
+            """Record accepted website states and the explicit unavailable interval."""
+            await self.fox.publish_data(live_only=True)
+            states.append(self.fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"])
+
+        self.fox.publish_cloud_data = publish
+        socket = SimpleNamespace(send_str=AsyncMock(), receive=receive)
+        session = MagicMock()
+        session.ws_connect.return_value = context(socket)
+        with self.assertRaises(ConnectionError):
+            await self.stream.listen(session, "private-token")
+        self.assertEqual(states, [23, None, 23])
+        self.assertEqual(socket.send_str.await_count, 3)
+        session.ws_connect.assert_called_once()
+        self.assertNotIn("heartbeat", session.ws_connect.call_args.kwargs)
+
+    async def test_v2_preparation_is_signed_and_does_not_renew_status(self):
+        """Mirror the portal's GET plantID request every sixty seconds using the v2 token."""
+        await self.publish_live()
+        expiry = self.stream.expires_at
+        response = MagicMock()
+
+        async def reply():
+            """Spend two seconds on HTTP without changing status freshness."""
+            self.monotonic += 2
+            return {"errno": 0, "result": {"plantLive": 0}}
+
+        response.json = reply
+        session = MagicMock()
+        session.get.return_value = context(response)
+        with patch("fox.asyncio.sleep", new_callable=AsyncMock, side_effect=asyncio.CancelledError()) as sleep:
+            with self.assertRaises(asyncio.CancelledError):
+                await self.stream.renew_v2_flow(session, "private-token")
+        call = session.get.call_args
+        self.assertTrue(call.args[0].endswith("/dew/w/plant/flow/preInfo"))
+        self.assertEqual(call.kwargs["params"], {"plantID": "plant1"})
+        self.assertEqual(call.kwargs["headers"]["token"], "private-token")
+        self.assertEqual(call.kwargs["headers"]["X-Auth-Platform"], "FOX_CLOUD_WEB_2_0")
+        sleep.assert_awaited_once_with(58)
+        self.assertEqual(self.stream.expires_at, expiry)
+
+    async def test_v2_preparation_failure_is_nonfatal_and_redacted(self):
+        """A rejected periodic read logs a code and retries without promoting status."""
+        response = MagicMock()
+        response.json = AsyncMock(return_value={"errno": 41819, "msg": "private-token"})
+        session = MagicMock()
+        session.get.return_value = context(response)
+        with patch("fox.asyncio.sleep", new_callable=AsyncMock, side_effect=asyncio.CancelledError()) as sleep:
+            with self.assertRaises(asyncio.CancelledError):
+                await self.stream.renew_v2_flow(session, "private-token")
+        sleep.assert_awaited_once_with(60)
+        self.assertFalse(self.stream.values)
+        self.assertIn("errno=41819", str(self.fox.log_messages))
+        self.assertNotIn("private-token", str(self.fox.log_messages))
+
+    async def test_v2_periodic_task_is_cancelled_on_reader_exit(self):
+        """Stopping the reader must not leave an authenticated polling task running."""
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def renewal(session, token):
+            """Represent the long-lived periodic task and observe its cleanup."""
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        async def reader(session, token):
+            """Fail after the background task has actually started."""
+            await started.wait()
+            raise ConnectionError()
+
+        self.stream.renew_v2_flow = renewal
+        self.stream.listen_with_reconnect = reader
+        with self.assertRaises(ConnectionError):
+            await self.stream.listen_with_renewal(object(), "private-token")
+        self.assertTrue(cancelled.is_set())
 
 
 def run_fox_safety_tests(my_predbat):
