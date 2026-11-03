@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
-from fox import FoxCloudStream, fox_cloud_values, fox_sample_time
+from fox_realtime import FoxCloudStream, fox_cloud_values, fox_sample_time
 from tests.test_fox_realtime import make_fox, live_frame, context
 
 
@@ -40,9 +40,11 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         }
         self.fox.base.get_arg = self.get_arg
         self.fox.base.get_state_wrapper = lambda entity, raw=False: self.fox.base.entities.get(entity, {})
-        patcher = patch("fox.time", SimpleNamespace(monotonic=lambda: self.monotonic, time=lambda: self.wall))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        clock = SimpleNamespace(monotonic=lambda: self.monotonic, time=lambda: self.wall)
+        for module in ("fox", "fox_realtime"):
+            patcher = patch(f"{module}.time", clock)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def get_arg(self, argument, default=None, index=None, **kwargs):
         """Resolve configured per-inverter entity IDs just as the real argument getter does."""
@@ -336,6 +338,7 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(socket.send_str.await_count, 3)
         session.ws_connect.assert_called_once()
         self.assertNotIn("heartbeat", session.ws_connect.call_args.kwargs)
+        self.assertEqual(sum("v2 website status active" in message for message in self.fox.log_messages), 2)
 
     async def test_latest_v2_survives_pause_until_openapi_catches_up(self):
         """A delayed API cannot replace a newer v2 SoC; a newer API sample can."""
@@ -462,7 +465,7 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         response.json = AsyncMock(side_effect=[{"errno": 41819, "msg": "private-token"}, asyncio.CancelledError()])
         session = MagicMock()
         session.post.return_value = context(response)
-        with patch("fox.aiohttp.ClientSession", return_value=context(session)), patch("fox.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        with patch("fox_realtime.aiohttp.ClientSession", return_value=context(session)), patch("fox_realtime.asyncio.sleep", new_callable=AsyncMock) as sleep:
             with self.assertRaises(asyncio.CancelledError):
                 await self.stream.run()
         self.assertEqual(session.post.call_count, 2)
@@ -492,7 +495,7 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
             await real_sleep(0)
 
         self.stream.listen = listen
-        with patch("fox.aiohttp.ClientSession", return_value=context(session)), patch("fox.asyncio.sleep", side_effect=sleep) as backoff:
+        with patch("fox_realtime.aiohttp.ClientSession", return_value=context(session)), patch("fox_realtime.asyncio.sleep", side_effect=sleep) as backoff:
             with self.assertRaises(asyncio.CancelledError):
                 await self.stream.run()
         self.stream.login.assert_awaited_once_with(session)

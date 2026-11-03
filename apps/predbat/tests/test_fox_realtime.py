@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
-from fox import FoxAPI, FoxCloudStream, FOX_CLOUD_MAX_AGE, fox_cloud_headers, fox_cloud_values
+from fox import FoxAPI
+from fox_realtime import FoxCloudStream, FOX_CLOUD_MAX_AGE, fox_cloud_headers, fox_cloud_values
 from tests.test_fox_api import MockFoxAPIWithRequests
 
 
@@ -203,7 +204,7 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
             reading = fox.dashboard_items["sensor.predbat_fox_sn1_" + suffix]
             self.assertEqual(reading["state"], -2 if suffix == "invbatpower" else 0.3)
         self.assertEqual(stream.values["invBatPower"], retained)
-        with patch("fox.time.monotonic", return_value=float("inf")):
+        with patch("fox_realtime.time.monotonic", return_value=float("inf")):
             await fox.publish_cloud_data("SN1")
         self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_meterpower"]["attributes"]["source"], "fox_cloud_cached")
 
@@ -236,13 +237,13 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         fox.device_values["SN2"] = {"SoC": {"value": 87, "name": "SoC", "unit": "%", "timestamp": datetime.now(timezone.utc).isoformat()}}
         stream = FoxCloudStream(fox, "SN1", "plant1")
         fox.cloud_streams["SN1"] = stream
-        with patch("fox.time.monotonic", return_value=100):
+        with patch("fox_realtime.time.monotonic", return_value=100):
             await stream.accept_values(*fox_cloud_values(live_frame(soc=None)))
             await fox.publish_data()
             self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 42)
             self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn2_soc"]["state"], 87)
             self.assertTrue(stream.current_values())
-        with patch("fox.time.monotonic", return_value=125):
+        with patch("fox_realtime.time.monotonic", return_value=125):
             self.assertEqual(stream.current_values(), {})
 
     async def test_login_uses_only_website_credentials(self):
@@ -307,7 +308,7 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         socket.receive = receive
         session = MagicMock()
         session.ws_connect.return_value = context(socket)
-        with patch("fox.time.monotonic", side_effect=lambda: now[0]):
+        with patch("fox_realtime.time.monotonic", side_effect=lambda: now[0]):
             with self.assertRaises(asyncio.TimeoutError):
                 await stream.listen(session, "token")
         fox.publish_cloud_data.assert_not_awaited()
@@ -322,7 +323,7 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         stream.login = AsyncMock(return_value="secret-token")
         stream.listen = AsyncMock(side_effect=[ConnectionError("wss://host?token=secret-token"), asyncio.CancelledError()])
 
-        with patch("fox.aiohttp.ClientSession", return_value=context(MagicMock())), patch("fox.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        with patch("fox_realtime.aiohttp.ClientSession", return_value=context(MagicMock())), patch("fox_realtime.asyncio.sleep", new_callable=AsyncMock) as sleep:
             with self.assertRaises(asyncio.CancelledError):
                 await stream.run()
         self.assertEqual(stream.values, retained)
@@ -359,7 +360,7 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         fox.cloud_streams["SN1"] = stream
         fox.data_age["device_values"] = "unchanged"
         stream.login = AsyncMock(side_effect=[ValueError("login rejected"), asyncio.CancelledError()])
-        with patch("fox.aiohttp.ClientSession", return_value=context(MagicMock())), patch("fox.asyncio.sleep", new_callable=AsyncMock):
+        with patch("fox_realtime.aiohttp.ClientSession", return_value=context(MagicMock())), patch("fox_realtime.asyncio.sleep", new_callable=AsyncMock):
             with self.assertRaises(asyncio.CancelledError):
                 await stream.run()
         self.assertEqual(fox.data_age["device_values"], "unchanged")
@@ -399,7 +400,7 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         socket_context = context(socket)
         session.ws_connect.return_value = socket_context
         session_context = context(session)
-        with patch("fox.aiohttp.ClientSession", return_value=session_context):
+        with patch("fox_realtime.aiohttp.ClientSession", return_value=session_context):
             with self.assertRaises(asyncio.CancelledError):
                 await stream.run()
         stream.login.assert_awaited_once_with(session)
