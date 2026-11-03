@@ -100,7 +100,6 @@ FOX_CLOUD_MAX_AGE = 30
 FOX_CLOUD_RECOVERY_SECONDS = 120
 FOX_CLOUD_LOGIN_PATH = "/basic/v0/user/login"
 FOX_CLOUD_WS_PATH = "/dew/v0/wsmaitian"
-FOX_CLOUD_PREINFO_PATH = "/dew/w/plant/flow/preInfo"
 
 
 def fox_cloud_headers(path, timestamp, local_tz, token=""):
@@ -369,36 +368,15 @@ class FoxCloudStream:
                 deadline = self.expires_at
                 recovery_deadline = received_at + FOX_CLOUD_RECOVERY_SECONDS
 
-    async def renew_v2_flow(self, session, token):
-        """Mirror the portal's initial and once-a-minute flow preparation request."""
-        while True:
-            started_at = time.monotonic()
-            try:
-                headers = fox_cloud_headers(FOX_CLOUD_PREINFO_PATH, str(int(time.time() * 1000)), self.owner.local_tz, token=token)
-                async with session.get(FOX_DOMAIN + FOX_CLOUD_PREINFO_PATH, headers=headers, params={"plantID": self.plant_id}, timeout=aiohttp.ClientTimeout(total=20)) as response:
-                    response.raise_for_status()
-                    reply = await response.json()
-                if not isinstance(reply, dict) or reply.get("errno") != 0:
-                    code = reply.get("errno") if isinstance(reply, dict) else None
-                    raise FoxCloudError(f"flow preparation rejected (errno={code})" if isinstance(code, int) else "invalid flow preparation response")
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                self.owner.log(f"Warn: Fox: v2 website flow preparation failed for {self.device_sn} ({fox_cloud_failure(error)}); retry in 60s")
-            # A successful HTTP request is not a fresh status sample.
-            await asyncio.sleep(max(1, 60 - (time.monotonic() - started_at)))
-
     async def run(self):
         """Run one v2 session/retry loop, retaining cached status between connections."""
         token, delay = None, 5
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
             while True:
-                renewal = None
                 self.received_data = False
                 try:
                     if token is None:
                         token = await self.login(session)
-                    renewal = asyncio.create_task(self.renew_v2_flow(session, token))
                     await self.listen(session, token)
                 except asyncio.CancelledError:
                     raise
@@ -409,9 +387,6 @@ class FoxCloudStream:
                         token = None
                     self.owner.log(f"Warn: Fox: v2 website failed for {self.device_sn} ({fox_cloud_failure(error)}); retaining freshest known status, retry in {delay}s")
                 finally:
-                    if renewal is not None:
-                        renewal.cancel()
-                        await asyncio.gather(renewal, return_exceptions=True)
                     had_live_data = bool(self.expires_at)
                     self.expires_at = 0
                     self.active_version = None

@@ -337,45 +337,6 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         session.ws_connect.assert_called_once()
         self.assertNotIn("heartbeat", session.ws_connect.call_args.kwargs)
 
-    async def test_v2_preparation_is_signed_and_does_not_renew_status(self):
-        """Mirror the portal's GET plantID request every sixty seconds using the v2 token."""
-        await self.publish_live()
-        expiry = self.stream.expires_at
-        response = MagicMock()
-
-        async def reply():
-            """Spend two seconds on HTTP without changing status freshness."""
-            self.monotonic += 2
-            return {"errno": 0, "result": {"plantLive": 0}}
-
-        response.json = reply
-        session = MagicMock()
-        session.get.return_value = context(response)
-        with patch("fox.asyncio.sleep", new_callable=AsyncMock, side_effect=asyncio.CancelledError()) as sleep:
-            with self.assertRaises(asyncio.CancelledError):
-                await self.stream.renew_v2_flow(session, "private-token")
-        call = session.get.call_args
-        self.assertTrue(call.args[0].endswith("/dew/w/plant/flow/preInfo"))
-        self.assertEqual(call.kwargs["params"], {"plantID": "plant1"})
-        self.assertEqual(call.kwargs["headers"]["token"], "private-token")
-        self.assertEqual(call.kwargs["headers"]["X-Auth-Platform"], "FOX_CLOUD_WEB_2_0")
-        sleep.assert_awaited_once_with(58)
-        self.assertEqual(self.stream.expires_at, expiry)
-
-    async def test_v2_preparation_failure_is_nonfatal_and_redacted(self):
-        """A rejected periodic read logs a code and retries without promoting status."""
-        response = MagicMock()
-        response.json = AsyncMock(return_value={"errno": 41819, "msg": "private-token"})
-        session = MagicMock()
-        session.get.return_value = context(response)
-        with patch("fox.asyncio.sleep", new_callable=AsyncMock, side_effect=asyncio.CancelledError()) as sleep:
-            with self.assertRaises(asyncio.CancelledError):
-                await self.stream.renew_v2_flow(session, "private-token")
-        sleep.assert_awaited_once_with(60)
-        self.assertFalse(self.stream.values)
-        self.assertIn("errno=41819", str(self.fox.log_messages))
-        self.assertNotIn("private-token", str(self.fox.log_messages))
-
     async def test_latest_v2_survives_pause_until_openapi_catches_up(self):
         """A delayed API cannot replace a newer v2 SoC; a newer API sample can."""
         self.date_openapi(self.wall - 120)
@@ -510,40 +471,36 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fox.key, "test_api_key")
         self.assertNotIn("private-token", str(self.fox.log_messages))
 
-    async def test_single_retry_loop_reuses_token_and_cleans_up_periodic_tasks(self):
-        """A dropped working connection retries without login and cancels each periodic task."""
-        started = [asyncio.Event(), asyncio.Event()]
-        cancelled = []
+    async def test_reconnect_uses_existing_token_without_http_preparation(self):
+        """Reconnect a working stream without extra HTTP requests or another login."""
         attempts = []
+        real_sleep = asyncio.sleep
+        session = MagicMock()
         self.stream.login = AsyncMock(return_value="private-token")
 
-        async def renew(session, token):
-            """Track task startup and cancellation for each connection."""
-            index = len(attempts) - 1
-            started[index].set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                cancelled.append(index)
-
-        async def listen(session, token):
-            """Drop once after valid status, then cancel the recovered connection."""
+        async def listen(client, token):
+            """Yield to any background tasks, drop once, then cancel after reconnect."""
             attempts.append(token)
-            await started[len(attempts) - 1].wait()
+            await real_sleep(0)
             if len(attempts) == 1:
                 await self.publish_live(soc=23)
                 raise ConnectionError("private-token")
             raise asyncio.CancelledError()
 
-        self.stream.renew_v2_flow = renew
+        async def sleep(delay):
+            """Yield without waiting for the reconnect backoff."""
+            await real_sleep(0)
+
         self.stream.listen = listen
-        with patch("fox.aiohttp.ClientSession", return_value=context(MagicMock())), patch("fox.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        with patch("fox.aiohttp.ClientSession", return_value=context(session)), patch("fox.asyncio.sleep", side_effect=sleep) as backoff:
             with self.assertRaises(asyncio.CancelledError):
                 await self.stream.run()
-        self.stream.login.assert_awaited_once()
+        self.stream.login.assert_awaited_once_with(session)
         self.assertEqual(attempts, ["private-token", "private-token"])
-        self.assertEqual(cancelled, [0, 1])
-        sleep.assert_awaited_once_with(5)
+        backoff.assert_awaited_once_with(5)
+        session.get.assert_not_called()
+        self.assertEqual(self.fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 23)
+        self.assertEqual(self.fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["attributes"]["source"], "fox_cloud_cached")
         self.assertNotIn("private-token", str(self.fox.log_messages))
 
 
