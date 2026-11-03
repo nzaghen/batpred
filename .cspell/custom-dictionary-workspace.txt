@@ -58,6 +58,8 @@ backpropagation
 backsteps
 backtest
 Basepath
+batchargepower
+batdischargepower
 bathighcap
 Batpred
 battemperature

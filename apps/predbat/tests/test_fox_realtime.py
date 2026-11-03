@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
-from fox import FoxAPI, FoxCloudStream, FoxCloudError, FOX_CLOUD_MAX_AGE, FOX_CACHE_KEYS, FOX_SETTINGS_CACHE_VERSION, fox_cloud_headers, fox_cloud_values, fox_cloud_planner_values, fox_v1_values, fox_cloud_failure
-from tests.test_fox_api import MockFoxAPIWithRequests, MockFoxAPIWithRunTracking
+from fox import FoxAPI, FoxCloudStream, FOX_CLOUD_MAX_AGE, fox_cloud_headers, fox_cloud_values, fox_cloud_planner_values
+from tests.test_fox_api import MockFoxAPIWithRequests
 
 
 def live_frame(soc="54.5", age=5):
@@ -45,7 +45,7 @@ def make_fox():
         }
     }
     for item in fox.device_values["SN1"].values():
-        item["timestamp"] = datetime.now(timezone.utc).isoformat()
+        item["timestamp"] = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     return fox
 
 
@@ -72,7 +72,7 @@ class TestFoxLiveMapping(unittest.TestCase):
                 self.assertNotIn("invBatPower", fox_cloud_planner_values(values))
 
     def test_native_live_net_power_takes_priority(self):
-        """Retain direct v1 net-power telemetry, including its case and units."""
+        """Retain direct signed net-power telemetry, including its case and units."""
         values = {"INVBATPOWER": {"value": -1234, "unit": "W"}, "batChargePower": {"value": 2, "unit": "kW"}, "batDischargePower": {"value": 0, "unit": "kW"}}
         self.assertEqual(fox_cloud_planner_values(values), values)
 
@@ -157,7 +157,7 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
                 frame["result"]["node"]["bat"]["charge"] = battery_direction
                 frame["result"]["node"]["grid"]["gridStatus"] = grid_direction
                 values, age = fox_cloud_values(frame)
-                await stream.accept_values(values, age, "v2")
+                await stream.accept_values(values, age)
                 for argument, expected in {"soc_percent": 0, "battery_power": battery_watts, "grid_power": grid_watts, "pv_power": 3500, "load_power": 1800}.items():
                     reading = fox.dashboard_items[fox.args_set[argument][0]]
                     value = reading["state"] * (1000 if reading["attributes"]["unit_of_measurement"] == "kW" else 1)
@@ -193,7 +193,7 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("website_version", reading["attributes"])
 
     async def test_missing_live_net_power_does_not_reuse_an_old_frame(self):
-        """Partial website frames fall back per field, and live-only fields expire."""
+        """A missing field retains its last known value with an explicit cached label."""
         fox = make_fox()
         stream = FoxCloudStream(fox, "SN1", "plant1")
         fox.cloud_streams["SN1"] = stream
@@ -208,22 +208,8 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         await fox.publish_cloud_data("SN1")
         for suffix in ("invbatpower", "meterpower"):
             reading = fox.dashboard_items["sensor.predbat_fox_sn1_" + suffix]
-            self.assertIsNone(reading["state"])
-            self.assertEqual(reading["attributes"]["source"], "openapi")
-
-    async def test_v1_flow_supplies_signed_planner_power_with_age_metadata(self):
-        """Legacy flow power reaches existing planner bindings without a freshness claim."""
-        fox = make_fox()
-        stream = FoxCloudStream(fox, "SN1", "plant1")
-        fox.cloud_streams["SN1"] = stream
-        message = {"msgType": "data", "sequence": "flow", "data": {"invBatPower": {"value": 1200, "unit": "W"}, "gridConsumptionPower": {"value": 0, "unit": "W"}, "feedinPower": {"value": 0.7, "unit": "kW"}}}
-        await stream.accept_values(fox_v1_values(message, {}), 0, "v1")
-        for suffix, expected in (("invbatpower", 1.2), ("meterpower", -0.7)):
-            reading = fox.dashboard_items["sensor.predbat_fox_sn1_" + suffix]
-            self.assertEqual(reading["state"], expected)
-            self.assertEqual(reading["attributes"]["source"], "fox_cloud_v1")
-            self.assertEqual(reading["attributes"]["website_version"], "v1")
-            self.assertFalse(reading["attributes"]["sample_age_known"])
+            self.assertEqual(reading["state"], -2 if suffix == "invbatpower" else 0.3)
+        self.assertEqual(reading["attributes"]["source"], "fox_cloud_cached")
 
     async def test_live_soc_wins_without_poisoning_openapi_cache(self):
         """Old per-battery SoC and later OpenAPI polls cannot overwrite live SoC."""
@@ -343,17 +329,17 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         stream.expires_at = float("inf")
         stream.login = AsyncMock(return_value="secret-token")
         stream.listen = AsyncMock(side_effect=[ConnectionError("wss://host?token=secret-token"), asyncio.CancelledError()])
-        stream.listen_v1 = AsyncMock(side_effect=ConnectionError("wss://host?token=secret-token"))
+
         with patch("fox.aiohttp.ClientSession", return_value=context(MagicMock())), patch("fox.asyncio.sleep", new_callable=AsyncMock) as sleep:
             with self.assertRaises(asyncio.CancelledError):
                 await stream.run()
         self.assertEqual(stream.values, {})
-        self.assertEqual(stream.login.await_count, 3)
+        self.assertEqual(stream.login.await_count, 2)
         self.assertEqual(fox.key, "test_api_key")
         self.assertNotIn("secret-token", str(fox.log_messages))
-        self.assertIn("using OpenAPI", str(fox.log_messages))
+        self.assertIn("retaining freshest known status", str(fox.log_messages))
         self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 42)
-        sleep.assert_awaited_once_with(30)
+        sleep.assert_awaited_once_with(5)
 
     async def test_live_publication_sends_only_flow_sensors(self):
         """Five-second updates do not republish settings, static data or counters."""
@@ -372,8 +358,8 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         stream.values = {}
         stream.expires_at = 0
         await fox.publish_cloud_data("SN1", refresh=True)
-        self.assertIsNone(fox.dashboard_items["sensor.predbat_fox_sn1_pvpower"]["state"])
-        self.assertIsNone(fox.dashboard_items["sensor.predbat_fox_sn1_battery_flow"]["state"])
+        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_pvpower"]["state"], 3.5)
+        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_battery_flow"]["state"], -2)
         self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 42)
 
     async def test_repeated_login_failure_preserves_openapi_poll_cadence(self):
@@ -408,249 +394,6 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         await fox.start_cloud_streams()
         self.assertEqual(fox.cloud_streams, {})
 
-
-class TestFoxV1Fallback(unittest.IsolatedAsyncioTestCase):
-    """Check the legacy protocol and the complete website fallback sequence."""
-
-    async def test_v1_login_is_distinct_and_signed_with_website_token(self):
-        """V1 uses its own login body and does not send v2's platform selector."""
-        stream = FoxCloudStream(make_fox(), "SN1", "plant1")
-        response = MagicMock()
-        response.json = AsyncMock(return_value={"errno": 0, "result": {"token": "v1-token"}})
-        session = MagicMock()
-        session.post.return_value = context(response)
-        self.assertEqual(await stream.login(session, version="v1"), "v1-token")
-        self.assertTrue(session.post.call_args.args[0].endswith("/c/v0/user/login"))
-        body = session.post.call_args.kwargs["json"]
-        self.assertEqual(body, {"user": "test-user", "password": "dfb450efddbb5387197c84460623675b", "accountType": "phone"})
-        self.assertNotIn("X-Auth-Platform", session.post.call_args.kwargs["headers"])
-        headers = fox_cloud_headers("/generic/v0/device/list", "1793714400000", timezone.utc, token="v1-token", version="v1")
-        self.assertEqual(headers["token"], "v1-token")
-        self.assertNotEqual(headers["signature"], fox_cloud_headers("/generic/v0/device/list", "1793714400000", timezone.utc)["signature"])
-
-    async def test_v1_detail_maps_soc_and_energy_without_claiming_sample_age(self):
-        """Keep zero SoC, energy units and the explicit unknown-age metadata."""
-        message = {"msgType": "data", "sequence": "flowDetail", "data": {"blocks": [{"values": [{"variable": "SoC", "value": 0, "unit": "%"}, {"variable": "Export energy", "value": 1234.6, "unit": "kWh"}]}]}}
-        values = fox_v1_values(message, make_fox().device_values["SN1"])
-        self.assertEqual(values["SoC"]["value"], 0)
-        self.assertEqual(values["feedin"]["value"], 1234.6)
-        self.assertEqual(values["feedin"]["unit"], "kWh")
-        self.assertFalse(values["SoC"]["sample_age_known"])
-        self.assertEqual(values["SoC"]["source"], "fox_cloud_v1")
-        for invalid in (None, [], {}, {"msgType": "response"}, {"msgType": "data", "errno": 41819, "data": {}}, {"msgType": "data", "data": []}):
-            self.assertEqual(fox_v1_values(invalid, {}), {})
-
-    async def test_v1_native_flow_units_and_signed_battery_power(self):
-        """The legacy feed's negative inverter battery power means charging."""
-        data = {"pvPower": [{"value": 1.2}, {"value": 500, "unit": "W"}], "loadsPower": {"value": 2.1}, "invBatPower": {"value": -1500, "unit": "W"}, "feedinPower": {"value": 0}}
-        values = fox_v1_values({"msgType": "data", "sequence": "flow", "data": data}, {})
-        self.assertEqual(values["pvPower"]["value"], 1.7)
-        self.assertEqual(values["loadsPower"]["value"], 2.1)
-        self.assertEqual(values["batChargePower"]["value"], 1.5)
-        self.assertEqual(values["batDischargePower"]["value"], 0)
-        data["pvPower"] = [{"value": "--"}]
-        data["invBatPower"]["value"] = "NaN"
-        values = fox_v1_values({"msgType": "data", "sequence": "flow", "data": data}, {})
-        self.assertNotIn("pvPower", values)
-        self.assertNotIn("batChargePower", values)
-
-    async def test_v1_source_metadata_and_openapi_fallback_are_published(self):
-        """The existing SoC sensor exposes the version and its unknown sample age."""
-        fox = make_fox()
-        stream = FoxCloudStream(fox, "SN1", "plant1")
-        fox.cloud_streams["SN1"] = stream
-        await stream.accept_values({"SoC": {"value": 51, "unit": "%", "name": "SoC", "source": "fox_cloud_v1"}}, 0, "v1")
-        reading = fox.dashboard_items["sensor.predbat_fox_sn1_soc"]
-        self.assertEqual(reading["state"], 51)
-        self.assertEqual(reading["attributes"]["website_version"], "v1")
-        self.assertFalse(reading["attributes"]["sample_age_known"])
-        stream.values = {}
-        stream.expires_at = 0
-        await fox.publish_cloud_data("SN1", refresh=True)
-        reading = fox.dashboard_items["sensor.predbat_fox_sn1_soc"]
-        self.assertEqual(reading["state"], 42)
-        self.assertEqual(reading["attributes"]["source"], "openapi")
-        self.assertNotIn("website_version", reading["attributes"])
-
-    async def test_v1_flow_frames_cannot_extend_an_old_soc(self):
-        """A stalled detailed subscription expires despite continuing power frames."""
-        fox = make_fox()
-        fox.device_detail["SN1"]["hasBattery"] = False
-        fox.publish_cloud_data = AsyncMock()
-        stream = FoxCloudStream(fox, "SN1", "plant1")
-        stream.v1_request = AsyncMock(return_value={"devices": [{"deviceSN": "SN1", "id": "device1"}]})
-        clock = [100]
-        frames = iter(
-            [
-                (100, {"msgType": "data", "sequence": "flowDetail", "data": {"blocks": [{"values": [{"variable": "SoC", "value": 50}]}]}}),
-                (120, {"msgType": "data", "sequence": "flow", "data": {"loadsPower": {"value": 1.2}}}),
-                (131, {"msgType": "data", "sequence": "flow", "data": {"loadsPower": {"value": 1.2}}}),
-            ]
-        )
-
-        async def receive():
-            """Deliver independently dated detailed and flow frames."""
-            entry = next(frames, None)
-            if entry is None:
-                clock[0] = 161
-                raise asyncio.TimeoutError()
-            clock[0], data = entry
-            message = MagicMock(type=aiohttp.WSMsgType.TEXT)
-            message.json.return_value = data
-            return message
-
-        socket = MagicMock()
-        socket.send_json = AsyncMock()
-        socket.send_str = AsyncMock()
-        socket.receive = receive
-        session = MagicMock()
-        session.ws_connect.return_value = context(socket)
-        with patch("fox.time.monotonic", side_effect=lambda: clock[0]):
-            with self.assertRaises(asyncio.TimeoutError):
-                await stream.listen_v1(session, "token")
-            self.assertEqual(stream.current_values(), {})
-        self.assertEqual(fox.publish_cloud_data.await_count, 3)
-        self.assertNotIn("SoC", stream.values)
-        self.assertEqual(stream.values["loadsPower"]["value"], 1.2)
-        self.assertIn("flow=2, flowDetail=1", str(fox.log_messages))
-
-    async def test_v1_socket_uses_matched_device_and_reads_battery_soc(self):
-        """Subscribe by website device ID and supplement the flow's missing SoC."""
-        fox = make_fox()
-        fox.publish_cloud_data = AsyncMock()
-        stream = FoxCloudStream(fox, "SN1", "plant1")
-        stream.v1_request = AsyncMock(side_effect=[{"devices": [{"deviceSN": "SN1", "id": "device1"}]}, {"batterys": [{"soc": 0}, {"soc": 20}]}])
-        message = MagicMock(type=aiohttp.WSMsgType.TEXT)
-        message.json.return_value = {"msgType": "data", "sequence": "flow", "data": {"loadsPower": {"value": 1.2}}}
-        socket = MagicMock()
-        socket.send_json = AsyncMock()
-        socket.send_str = AsyncMock()
-        socket.receive = AsyncMock(side_effect=[message, MagicMock(type=aiohttp.WSMsgType.CLOSED)])
-        session = MagicMock()
-        session.ws_connect.return_value = context(socket)
-        with self.assertRaises(ConnectionError):
-            await stream.listen_v1(session, "v1-token")
-        self.assertTrue(session.ws_connect.call_args.args[0].endswith("/c/v0/websocket"))
-        requests = [call.args[0] for call in socket.send_json.await_args_list]
-        self.assertEqual([request["resource"] for request in requests], ["/c/v0/device/real/all", "/c/v0/device/real/flow"])
-        self.assertTrue(all(request["parameters"]["deviceID"] == "device1" for request in requests))
-        self.assertEqual(stream.current_values()["SoC"]["value"], 10)
-        self.assertFalse(stream.current_values()["SoC"]["sample_age_known"])
-        self.assertIn("v1 website status active", str(fox.log_messages))
-        stream.v1_request = AsyncMock(return_value={"devices": [{"deviceSN": "OTHER", "id": "device1"}]})
-        with self.assertRaises(FoxCloudError):
-            await stream.listen_v1(session, "v1-token")
-
-    async def test_v1_status_rejection_has_safe_api_error_code(self):
-        """Report errno without including an arbitrary server message or URL."""
-        stream = FoxCloudStream(make_fox(), "SN1", "plant1")
-        response = MagicMock()
-        response.json = AsyncMock(return_value={"errno": 41819, "msg": "secret-token"})
-        session = MagicMock()
-        session.get.return_value = context(response)
-        with self.assertRaises(FoxCloudError) as caught:
-            await stream.v1_request(session, "secret-token", "/generic/v0/device/battery/info", {"id": "device1"})
-        self.assertIn("41819", fox_cloud_failure(caught.exception))
-        self.assertNotIn("secret-token", fox_cloud_failure(caught.exception))
-        self.assertEqual(fox_cloud_failure(aiohttp.ClientResponseError(MagicMock(), (), status=401, message="secret-token")), "HTTP 401")
-
-    async def test_both_failures_are_logged_before_openapi_and_retry(self):
-        """Try v2, then v1, then keep OpenAPI while backing off website retries."""
-        fox = make_fox()
-        stream = FoxCloudStream(fox, "SN1", "plant1")
-        fox.cloud_streams["SN1"] = stream
-        stream.login = AsyncMock(side_effect=[ValueError("secret-token"), FoxCloudError("login rejected (errno=41819)"), asyncio.CancelledError()])
-        with patch("fox.aiohttp.ClientSession", return_value=context(MagicMock())), patch("fox.asyncio.sleep", new_callable=AsyncMock) as sleep:
-            with self.assertRaises(asyncio.CancelledError):
-                await stream.run()
-        self.assertEqual([call.kwargs["version"] for call in stream.login.await_args_list], ["v2", "v1", "v2"])
-        logs = "\n".join(fox.log_messages)
-        self.assertIn("v2 website failed", logs)
-        self.assertIn("trying v1 website", logs)
-        self.assertIn("v1 website failed", logs)
-        self.assertIn("41819", logs)
-        self.assertIn("using OpenAPI", logs)
-        self.assertNotIn("secret-token", logs)
-        sleep.assert_awaited_once_with(30)
-
-    async def test_v1_recovery_and_later_v2_recovery_are_logged(self):
-        """A successful alternative and a recovered preferred source are visible."""
-        fox = make_fox()
-        fox.publish_cloud_data = AsyncMock()
-        stream = FoxCloudStream(fox, "SN1", "plant1")
-        stream.login = AsyncMock(return_value="token")
-        attempts = []
-
-        async def v2(session, token):
-            """Fail once, then supply a fresh preferred-source reading."""
-            attempts.append("v2")
-            if len(attempts) == 1:
-                raise ConnectionError()
-            await stream.accept_values(fox_cloud_values(live_frame())[0], 5, "v2")
-            raise asyncio.CancelledError()
-
-        async def v1(session, token):
-            """Supply an alternative snapshot before simulating a later dropout."""
-            attempts.append("v1")
-            await stream.accept_values({"SoC": {"value": 51, "name": "SoC", "unit": "%", "source": "fox_cloud_v1"}}, 0, "v1")
-            raise ConnectionError()
-
-        stream.listen = v2
-        stream.listen_v1 = v1
-        with patch("fox.aiohttp.ClientSession", return_value=context(MagicMock())), patch("fox.asyncio.sleep", new_callable=AsyncMock):
-            with self.assertRaises(asyncio.CancelledError):
-                await stream.run()
-        self.assertEqual(attempts, ["v2", "v1", "v2"])
-        self.assertIn("v1 website status active", str(fox.log_messages))
-        self.assertIn("v2 website status active", str(fox.log_messages))
-
-
-class TestFoxPolling(unittest.IsolatedAsyncioTestCase):
-    """Verify OpenAPI polling is configurable without changing stream authentication."""
-
-    async def test_poll_interval_defaults_and_minute_rounding(self):
-        """Keep five minutes by default and clamp/round custom values predictably."""
-        for requested, expected in [(300, 300), (120, 120), (60, 60), (61, 120), (1, 60), (-1, 60), (None, 300), (True, 300), ("invalid", 300), (float("nan"), 300)]:
-            with self.subTest(requested=requested):
-                fox = make_fox()
-                fox.initialize("api-key", False, poll_seconds=requested)
-                self.assertEqual(fox.poll_seconds, expected)
-                self.assertEqual(fox.key, "api-key")
-        fox.initialize("api-key", False)
-        self.assertEqual(fox.poll_seconds, 300)
-
-    async def test_custom_interval_drives_status_refresh_and_keeps_other_caches(self):
-        """Poll status after two minutes, leaving settings and production untouched."""
-        fox = MockFoxAPIWithRunTracking()
-        fox.initialize("api-key", False, poll_seconds=120)
-        fox.device_list = [{"deviceSN": "TEST123"}]
-        fox.device_settings_version = FOX_SETTINGS_CACHE_VERSION
-        now = datetime.now(timezone.utc)
-        fox.data_age = {key: now for key in FOX_CACHE_KEYS}
-        fox.data_age["device_values"] = now - timedelta(seconds=119)
-        await fox.run(60, first=False)
-        self.assertNotIn("get_real_time_data:TEST123", fox.method_calls)
-        fox.method_calls = []
-        fox.data_age["device_values"] = now - timedelta(seconds=121)
-        await fox.run(120, first=False)
-        self.assertIn("get_real_time_data:TEST123", fox.method_calls)
-        self.assertNotIn("get_device_settings:TEST123", fox.method_calls)
-        self.assertNotIn("get_device_production_month:TEST123", fox.method_calls)
-        fox.method_calls = []
-        await fox.run(180, first=False)
-        self.assertNotIn("get_real_time_data:TEST123", fox.method_calls)
-
-    async def test_poll_setting_is_optional_and_accepted_by_schema(self):
-        """Expose the option through the normal component configuration path."""
-        from components import COMPONENT_LIST
-        from config import APPS_SCHEMA
-
-        option = COMPONENT_LIST["fox"]["args"]["poll_seconds"]
-        self.assertEqual(option["default"], 300)
-        self.assertFalse(option["required"])
-        self.assertEqual(option["config"], "fox_poll_seconds")
-        self.assertEqual(APPS_SCHEMA[option["config"]], {"type": "integer", "zero": False})
-
     async def test_multiple_stream_readings_use_one_login(self):
         """The actual stream loop authenticates once for several incoming readings."""
         fox = make_fox()
@@ -669,7 +412,7 @@ class TestFoxPolling(unittest.IsolatedAsyncioTestCase):
         with patch("fox.aiohttp.ClientSession", return_value=session_context):
             with self.assertRaises(asyncio.CancelledError):
                 await stream.run()
-        stream.login.assert_awaited_once_with(session, version="v2")
+        stream.login.assert_awaited_once_with(session)
         self.assertEqual(fox.publish_cloud_data.await_count, 4)  # Three readings, then cleanup
         session.ws_connect.assert_called_once()
         socket_context.__aexit__.assert_awaited_once()
@@ -678,5 +421,5 @@ class TestFoxPolling(unittest.IsolatedAsyncioTestCase):
 
 def run_fox_realtime_tests(my_predbat):
     """Register live-status regressions with Predbat's normal test runner."""
-    suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case) for case in (TestFoxLiveMapping, TestFoxLiveFallback, TestFoxV1Fallback, TestFoxPolling))
+    suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case) for case in (TestFoxLiveMapping, TestFoxLiveFallback))
     return not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()

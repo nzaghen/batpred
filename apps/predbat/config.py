@@ -2872,7 +2872,6 @@ APPS_SCHEMA = {
     "fox_key": {"type": "string", "empty": False},
     "fox_cloud_username": {"type": "string", "empty": False},
     "fox_cloud_password": {"type": "string", "empty": False},
-    "fox_poll_seconds": {"type": "integer", "zero": False},
     "fox_automatic": {"type": "boolean"},
     "fox_automatic_ignore_pv": {"type": "boolean"},
     "fox_inverter_sn": {"type": "string|string_list", "empty": False},

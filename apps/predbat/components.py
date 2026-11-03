@@ -363,7 +363,6 @@ COMPONENT_LIST = {
             },
             "cloud_username": {"required": False, "secret": True, "config": "fox_cloud_username"},
             "cloud_password": {"required": False, "secret": True, "config": "fox_cloud_password"},
-            "poll_seconds": {"required": False, "default": 300, "config": "fox_poll_seconds"},
             "automatic": {
                 "required": False,
                 "default": False,
