@@ -44,6 +44,8 @@ def make_fox():
             "feedin": {"value": 1234.5, "name": "Export energy", "unit": "kWh"},
         }
     }
+    for item in fox.device_values["SN1"].values():
+        item["timestamp"] = datetime.now(timezone.utc).isoformat()
     return fox
 
 
@@ -169,7 +171,8 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
     async def test_live_net_power_survives_openapi_poll_and_expires_to_baseline(self):
         """Fresh website net power beats an OpenAPI poll without changing its cache."""
         fox = make_fox()
-        fox.device_values["SN1"].update(invBatPower={"value": 900, "unit": "W"}, meterPower={"value": -600, "unit": "W"})
+        stamp = datetime.now(timezone.utc).isoformat()
+        fox.device_values["SN1"].update(invBatPower={"value": 900, "unit": "W", "timestamp": stamp}, meterPower={"value": -600, "unit": "W", "timestamp": stamp})
         baseline = deepcopy(fox.device_values)
         stream = FoxCloudStream(fox, "SN1", "plant1")
         fox.cloud_streams["SN1"] = stream
@@ -250,7 +253,7 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
     async def test_live_values_expire_per_frame_and_per_device(self):
         """Partial updates fall back per field and do not affect other inverters."""
         fox = make_fox()
-        fox.device_values["SN2"] = {"SoC": {"value": 87, "name": "SoC", "unit": "%"}}
+        fox.device_values["SN2"] = {"SoC": {"value": 87, "name": "SoC", "unit": "%", "timestamp": datetime.now(timezone.utc).isoformat()}}
         stream = FoxCloudStream(fox, "SN1", "plant1")
         fox.cloud_streams["SN1"] = stream
         stream.values, _ = fox_cloud_values(live_frame(soc=None))

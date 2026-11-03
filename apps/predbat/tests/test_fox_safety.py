@@ -3,13 +3,14 @@
 
 import asyncio
 from copy import deepcopy
+from datetime import datetime, timezone
 from types import SimpleNamespace, MethodType
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 from execute import Execute
-from fox import FoxCloudStream, fox_cloud_values, fox_cloud_planner_values
+from fox import FoxCloudStream, fox_cloud_values, fox_cloud_planner_values, fox_sample_time, FOX_OPENAPI_MAX_AGE
 from tests.test_fox_realtime import make_fox, live_frame, context
 
 
@@ -27,6 +28,8 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         )
         self.monotonic = 100.0
         self.wall = 1_000_000.0
+        for item in self.fox.device_values["SN1"].values():
+            item["timestamp"] = datetime.fromtimestamp(self.wall, timezone.utc).isoformat()
         self.stream = FoxCloudStream(self.fox, "SN1", "plant1")
         self.fox.cloud_streams["SN1"] = self.stream
         self.fox.base.args = {
@@ -141,7 +144,7 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         base.fetch_inverter_data.assert_called_once()
 
     async def test_openapi_fallback_preserves_pre_existing_behaviour(self):
-        """The new guard expires website sources only, leaving the old API path unchanged."""
+        """A correctly dated fallback newer than the live sample remains usable."""
         await self.publish_live()
         baseline = deepcopy(self.fox.device_values)
         self.wall += 30
@@ -153,7 +156,7 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         reading = self.fox.base.entities["sensor.predbat_fox_sn1_soc"]
         self.assertEqual(reading["state"], 42)
         self.assertEqual(reading["attributes"]["source"], "openapi")
-        self.assertNotIn("valid_until", reading["attributes"])
+        self.assertEqual(reading["attributes"]["valid_until"], 1_000_000 + FOX_OPENAPI_MAX_AGE)
         self.assertEqual(self.fox.device_values, baseline)
 
     async def test_guard_does_not_change_disabled_or_external_sensor_setups(self):
@@ -203,7 +206,7 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_live_power_falls_back_without_poisoning_observed_values(self):
         """Malformed v1 detail cannot replace a good net power or keep it live."""
-        self.fox.device_values["SN1"]["invBatPower"] = {"value": 0.7, "unit": "kW"}
+        self.fox.device_values["SN1"]["invBatPower"] = {"value": 0.7, "unit": "kW", "timestamp": datetime.fromtimestamp(self.wall, timezone.utc).isoformat()}
         await self.publish_live()
         original = deepcopy(self.stream.observed_values["invBatPower"])
         await self.stream.accept_values({"invBatPower": {"value": 999, "unit": "MW"}, "SoC": {"value": 53, "unit": "%"}}, 0, "v1")
@@ -403,6 +406,113 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         logs = str(self.fox.log_messages)
         self.assertIn("errno=41819.0, timeDiff=300.0s", logs)
         self.assertNotIn("private-token", logs)
+
+    def date_openapi(self, sampled_at):
+        """Give every baseline status field one explicit inverter sample time."""
+        stamp = datetime.fromtimestamp(sampled_at, timezone.utc).isoformat()
+        for item in self.fox.device_values["SN1"].values():
+            item["timestamp"] = stamp
+
+    async def test_sample_timestamp_formats_and_dst_are_unambiguous(self):
+        """Parse numeric offsets and reject missing times and ambiguous local DST times."""
+        expected = datetime(2026, 9, 14, 17, 43, 9, tzinfo=timezone.utc).timestamp()
+        for stamp in ("2026-09-14 18:43:09 BST+0100", "2026-09-14T17:43:09Z", "2026-09-14 17:43:09 GMT+0000", "2026-09-14T18:43:09+01:00", "2026-09-14 18:43:09"):
+            self.assertEqual(fox_sample_time(stamp, self.fox.local_tz), expected, stamp)
+        for stamp in (None, True, 1234, "", "2026-09-14", "2026-99-99 25:00:00", "2026-10-25 01:30:00", "2026-03-29 01:30:00"):
+            self.assertIsNone(fox_sample_time(stamp, self.fox.local_tz), stamp)
+
+    async def test_older_fallback_cannot_raise_soc_or_contaminate_history(self):
+        """Reproduce a discharge-time source switch to a delayed, higher OpenAPI SoC."""
+        self.date_openapi(self.wall - 120)
+        original = deepcopy(self.fox.device_values)
+        await self.publish_live(soc=23)
+        self.wall += 30
+        self.monotonic += 30
+        self.stream.values = {}
+        await self.fox.publish_cloud_data("SN1", refresh=True)
+        self.sync_publication()
+        reading = self.fox.base.entities["sensor.predbat_fox_sn1_soc"]
+        self.assertIsNone(reading["state"])
+        self.assertIn("predates", reading["attributes"]["stale_reason"])
+        self.assertIn("suspended", self.fox.planner_data_error(0))
+        self.assertIsNone(self.fox.dashboard_items["sensor.predbat_fox_sn1_battery_flow"]["state"])
+        self.assertEqual(self.fox.device_values, original)
+        await self.fox.publish_data()
+        self.assertEqual(self.fox.dashboard_items["sensor.predbat_fox_sn1_feedin"]["state"], 1234.5)
+        self.date_openapi(self.wall - 1)
+        self.fox.device_values["SN1"]["SoC_1"]["value"] = 22
+        await self.fox.publish_cloud_data("SN1")
+        self.sync_publication()
+        self.assertEqual(self.fox.base.entities["sensor.predbat_fox_sn1_soc"]["state"], 22)
+        self.assertIsNone(self.fox.planner_data_error(0))
+        # A repeated old response must not rewind a recovered fallback either.
+        self.date_openapi(self.wall - 10)
+        await self.fox.publish_cloud_data("SN1")
+        self.assertIsNone(self.fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"])
+
+    async def test_openapi_age_expires_even_when_publisher_is_stalled(self):
+        """Expiry is measured from the sample time, never the successful request time."""
+        self.date_openapi(self.wall - FOX_OPENAPI_MAX_AGE + 1)
+        await self.fox.publish_data()
+        self.sync_publication()
+        self.assertIsNone(self.fox.planner_data_error(0))
+        self.wall += 1
+        self.assertIn("suspended", self.fox.planner_data_error(0))
+        await self.fox.publish_data()
+        reading = self.fox.dashboard_items["sensor.predbat_fox_sn1_soc"]
+        self.assertIsNone(reading["state"])
+        self.assertIn("15 minutes", reading["attributes"]["stale_reason"])
+
+    async def test_openapi_unknown_or_future_timestamps_cannot_become_zero(self):
+        """A numerical SoC is unusable when its sample time cannot be trusted."""
+        for stamp in (None, "bad", datetime.fromtimestamp(self.wall + 61, timezone.utc).isoformat()):
+            for item in self.fox.device_values["SN1"].values():
+                item["timestamp"] = stamp
+            await self.fox.publish_data()
+            self.sync_publication()
+            self.assertIsNone(self.fox.base.entities["sensor.predbat_fox_sn1_soc"]["state"])
+            self.assertIsNotNone(self.fox.planner_data_error(0))
+
+    async def test_equal_sample_and_genuine_soc_increase_remain_valid(self):
+        """Chronology checks timestamps, not discharge direction or increasing SoC values."""
+        await self.publish_live(soc=23)
+        self.date_openapi(self.wall - 5)
+        self.stream.values = {}
+        self.stream.expires_at = 0
+        await self.fox.publish_cloud_data("SN1")
+        self.sync_publication()
+        self.assertEqual(self.fox.base.entities["sensor.predbat_fox_sn1_soc"]["state"], 42)
+        self.assertIsNone(self.fox.planner_data_error(0))
+
+    async def test_aggregate_soc_uses_the_oldest_pack_timestamp(self):
+        """A freshly updated pack cannot make another stale pack appear current."""
+        self.fox.device_values["SN1"]["SoC_2"] = {"value": 44, "unit": "%", "timestamp": datetime.fromtimestamp(self.wall - FOX_OPENAPI_MAX_AGE, timezone.utc).isoformat()}
+        await self.fox.publish_data()
+        self.assertIsNone(self.fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"])
+
+    async def test_openapi_only_setups_keep_their_existing_age_policy(self):
+        """Optional website safety must not alter installations without website credentials."""
+        self.fox.cloud_password = None
+        self.date_openapi(self.wall - 86400)
+        await self.fox.publish_data()
+        self.sync_publication()
+        reading = self.fox.base.entities["sensor.predbat_fox_sn1_soc"]
+        self.assertEqual(reading["state"], 42)
+        self.assertNotIn("valid_until", reading["attributes"])
+        self.assertIsNone(self.fox.planner_data_error(0))
+
+    async def test_use_time_guard_checks_openapi_sample_time_and_latest_live_sample(self):
+        """A delayed HA update cannot bypass ordering or trust a future/missing sample time."""
+        await self.fox.publish_data()
+        self.sync_publication()
+        original = deepcopy(self.fox.base.entities)
+        for sampled_at in (None, self.wall + 61):
+            self.fox.base.entities = deepcopy(original)
+            self.fox.base.entities["sensor.predbat_fox_sn1_soc"]["attributes"]["sample_time"] = sampled_at
+            self.assertIsNotNone(self.fox.planner_data_error(0))
+        self.fox.base.entities = original
+        self.stream.latest_samples["soc"] = self.wall + 1
+        self.assertIsNotNone(self.fox.planner_data_error(0))
 
 
 def run_fox_safety_tests(my_predbat):

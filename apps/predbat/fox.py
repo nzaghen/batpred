@@ -26,6 +26,8 @@ import json
 import argparse
 import random
 import math
+import re
+import pytz
 from urllib.parse import urlencode
 from component_base import ComponentBase
 from coordinator import inverter_record
@@ -95,6 +97,7 @@ FOX_REFRESH_REALTIME = 5  # Real time monitoring data
 # The website's live energy-flow socket is separate from OpenAPI telemetry. Never
 # promote its cached/keepalive frames to current readings, even while connected.
 FOX_CLOUD_MAX_AGE = 30
+FOX_OPENAPI_MAX_AGE = 15 * 60
 FOX_PLANNER_FIELDS = {"soc_percent": "soc", "battery_power": "invbatpower", "grid_power": "meterpower", "pv_power": "pvpower", "load_power": "loadspower"}
 FOX_SIGNED_POWER_FIELDS = {"invbatpower", "meterpower", "meterpower2"}
 FOX_POWER_FIELDS = FOX_SIGNED_POWER_FIELDS | {field.casefold() for field in ("batChargePower", "batDischargePower", "gridConsumptionPower", "feedinPower", "pvPower", "loadsPower", "generationPower", "epsPower")}
@@ -137,6 +140,56 @@ def fox_cloud_number(value):
         return number if math.isfinite(number) else None
     except (ValueError, TypeError):
         return None
+
+
+def fox_sample_time(value, local_tz):
+    """Parse Fox's inverter-local sample time, including BST/GMT numeric offsets."""
+    if not isinstance(value, str) or not value.strip() or len(value) > 80:
+        return None
+    if not re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}", value.strip()):
+        return None
+    # The documented format ends in zZ, e.g. BST+0100. Trust the numeric
+    # offset rather than platform-specific timezone abbreviation parsing.
+    value = re.sub(r" [A-Za-z]{1,8}(?=[+-]\d{4}$)", " ", value.strip())
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            if hasattr(local_tz, "localize"):
+                parsed = local_tz.localize(parsed, is_dst=None)
+            else:
+                first, second = parsed.replace(tzinfo=local_tz, fold=0), parsed.replace(tzinfo=local_tz, fold=1)
+                if first.utcoffset() != second.utcoffset():
+                    return None
+                parsed = first
+        return parsed.timestamp()
+    except (ValueError, TypeError, OverflowError, pytz.InvalidTimeError):
+        return None
+
+
+def fox_openapi_values(values, latest_samples, local_tz, now):
+    """Reject stale or backwards fallback status without altering stored API data."""
+    result = {}
+    for variable, item in values.items():
+        key = variable.casefold()
+        if item.get("source", "openapi") != "openapi" or not (key in FOX_POWER_FIELDS or key == "soc" or key.startswith("soc_")):
+            result[variable] = item
+            continue
+        sampled_at = fox_sample_time(item.get("timestamp"), local_tz)
+        reason = None
+        if sampled_at is None:
+            reason = "missing or invalid sample timestamp"
+        elif sampled_at > now + 60:
+            reason = "sample timestamp is in the future"
+        elif now - sampled_at >= FOX_OPENAPI_MAX_AGE:
+            reason = "sample is at least 15 minutes old"
+        elif sampled_at < latest_samples.get(key, float("-inf")):
+            reason = "sample predates the latest accepted reading"
+        result[variable] = {**item, "sample_time": sampled_at, "valid_until": sampled_at + FOX_OPENAPI_MAX_AGE if sampled_at is not None and not reason else 0}
+        if reason:
+            result[variable].update(value=None, stale_reason=reason)
+        else:
+            latest_samples[key] = sampled_at
+    return result
 
 
 def fox_cloud_power(node):
@@ -317,6 +370,7 @@ class FoxCloudStream:
         self.plant_id = plant_id
         self.values = {}
         self.observed_values = {}
+        self.latest_samples = {}
         self.expires_at = 0
         self.task = None
         self.active_version = None
@@ -356,6 +410,12 @@ class FoxCloudStream:
         for item in values.values():
             item["website_version"] = version
             item.setdefault("sample_age_known", version == "v2")
+        if version == "v2":
+            # Preserve chronology across reconnects and fallback; receiving an
+            # older OpenAPI response later must not make it the newer sample.
+            sampled_at = time.time() - age
+            for key in values:
+                self.latest_samples[key.casefold()] = max(sampled_at, self.latest_samples.get(key.casefold(), float("-inf")))
         self.values = values
         self.observed_values.update(values)
         self.expires_at = time.monotonic() + FOX_CLOUD_MAX_AGE - age
@@ -1119,9 +1179,17 @@ class FoxAPI(ComponentBase, OAuthMixin):
             deadline = fox_cloud_number(attributes.get("valid_until"))
             item = {"value": reading.get("state") if isinstance(reading, dict) else None, "unit": attributes.get("unit_of_measurement")}
             invalid = not fox_valid_planner_value(suffix, item)
-            expired = attributes.get("source") in ("fox_cloud", "fox_cloud_v1") and (deadline is None or time.time() >= deadline)
+            source = attributes.get("source", "openapi")
+            expired = source in ("fox_cloud", "fox_cloud_v1", "openapi") and (deadline is None or time.time() >= deadline)
+            if source == "openapi":
+                sampled_at = fox_cloud_number(attributes.get("sample_time"))
+                expired |= sampled_at is None or sampled_at > time.time() + 60 or time.time() - sampled_at >= FOX_OPENAPI_MAX_AGE
+                for sn, stream in getattr(self, "cloud_streams", {}).items():
+                    if entity == f"sensor.{self.prefix}_fox_{sn.lower()}_{suffix}":
+                        expired |= sampled_at is None or sampled_at < stream.latest_samples.get(suffix, float("-inf"))
             if invalid or expired:
-                return f"Fox {argument} is unavailable, invalid or stale ({entity}); new planning and execution suspended"
+                reason = attributes.get("stale_reason", "missing, invalid or expired input")
+                return f"Fox {argument} is unavailable, invalid or stale ({entity}: {reason}); new planning and execution suspended"
         return None
 
     async def final(self):
@@ -2464,6 +2532,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
         for sn in device_values:
             soc_total = 0
             soc_total_count = 0
+            soc_timestamps = []
             for item_name in device_values[sn]:
                 if item_name.lower().startswith("soc_"):
                     item = device_values[sn][item_name]
@@ -2475,13 +2544,15 @@ class FoxAPI(ComponentBase, OAuthMixin):
                     if soc is not None and soc > 0:
                         soc_total += soc
                         soc_total_count += 1
+                        soc_timestamps.append(item.get("timestamp", ""))
             if soc_total_count > 0:
                 # Remove the SOC dictionary key (any case) otherwise we might create a duplicate (different case)
                 for key in list(device_values[sn].keys()):
                     if key.lower() == "soc":
                         del device_values[sn][key]
                 # Add total SOC
-                device_values[sn]["SoC"] = {"name": "State of Charge Total", "unit": "%", "value": round(soc_total / soc_total_count, 0)}
+                oldest = min(soc_timestamps, key=lambda stamp: fox_sample_time(stamp, self.local_tz) if fox_sample_time(stamp, self.local_tz) is not None else float("-inf"))
+                device_values[sn]["SoC"] = {"name": "State of Charge Total", "unit": "%", "value": round(soc_total / soc_total_count, 0), "timestamp": oldest}
 
         cloud_variables = {}
         for sn, stream in getattr(self, "cloud_streams", {}).items():
@@ -2501,6 +2572,11 @@ class FoxAPI(ComponentBase, OAuthMixin):
                         if key.lower() == variable.lower():
                             del values[key]
                     values[variable] = {**item, "valid_until": valid_until}
+
+        if getattr(self, "cloud_username", None) and getattr(self, "cloud_password", None):
+            for sn, values in device_values.items():
+                stream = getattr(self, "cloud_streams", {}).get(sn)
+                device_values[sn] = fox_openapi_values(values, stream.latest_samples if stream else {}, self.local_tz, time.time())
 
         # Publish device values
         for sn in device_values:
@@ -2522,6 +2598,9 @@ class FoxAPI(ComponentBase, OAuthMixin):
                 }
                 if "valid_until" in item:
                     attributes["valid_until"] = item["valid_until"]
+                for key in ("sample_time", "stale_reason"):
+                    if key in item:
+                        attributes[key] = item[key]
                 if "website_version" in item:
                     attributes["website_version"] = item["website_version"]
                     attributes["sample_age_known"] = item.get("sample_age_known", False)
@@ -2544,6 +2623,8 @@ class FoxAPI(ComponentBase, OAuthMixin):
             charge_power = device_values.get(sn, {}).get("batChargePower", {}).get("value", 0)
             discharge_power = device_values.get(sn, {}).get("batDischargePower", {}).get("value", 0)
             battery_unavailable = charge_power is None and discharge_power is None
+            if getattr(self, "cloud_username", None) and getattr(self, "cloud_password", None):
+                battery_unavailable = charge_power is None or discharge_power is None
 
             try:
                 charge_power = float(charge_power) if charge_power is not None else 0.0
