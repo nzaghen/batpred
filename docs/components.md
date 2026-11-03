@@ -1425,6 +1425,9 @@ Integrates with Fox ESS inverters for monitoring and controlling Fox ESS battery
 | Option | Type | Required | Default | Config Key | Description |
 | ------ | ---- | -------- | ------- | ---------- | ----------- |
 | `key` | String | Yes | - | `fox_key` | Your Fox ESS API key |
+| `cloud_username` | String | No | unset | `fox_cloud_username` | Fox Cloud website username for optional live SoC and power readings |
+| `cloud_password` | String | No | unset | `fox_cloud_password` | Fox Cloud website password; configure both website credentials to enable live status |
+| `cloud_expensive` | Boolean | No | false | `fox_cloud_expensive` | Reconnect when live readings expire to try to sustain frequent updates; increases website connection traffic |
 | `automatic` | Boolean | No | false | `fox_automatic` | Set to `true` to automatically configured Predbat to use the Fox inverter (no manual `apps.yaml` updates required) |
 | `automatic_ignore_pv` | Boolean | No | false | `fox_automatic_ignore_pv` | When `automatic` is enabled, set to `true` to prevent Fox Cloud from overwriting `pv_power` and `pv_today` config. Useful for AC-coupled setups where PV is measured independently and Fox Cloud reports zero/absent PV data |
 | `poll_seconds` | Integer | No | `300` | `fox_poll_seconds` | How often to fetch live (real time) data such as battery SoC and power flows, in seconds, rounded to the nearest whole minute, minimum 60 and maximum 1800. See [Polling interval](#polling-interval-fox) |
@@ -1440,6 +1443,54 @@ Predbat fetches the live data from Fox Cloud every 5 minutes by default. Fox Clo
 Only the live data follows this setting. Device settings and the scheduler are still read every hour, production totals every 15 minutes, and the device list and details once a day.
 
 Each live poll is one request per inverter, so 2-minute polling raises that from 12 to 30 requests per inverter per hour. Fox Cloud limits how many API calls an account can make, so check your own headroom before going lower, especially with several inverters. Predbat logs its own request rate every minute (`Fox: API usage: ...`) and stops retrying failed requests while that rate is above 60 an hour. Polling faster than once every 5 minutes cannot make the data any fresher than Fox Cloud's own upload interval.
+
+#### Optional live status (fox)
+
+Add your Fox Cloud **website** credentials alongside the existing API key in `apps.yaml`:
+
+```yaml
+  fox_key: !secret fox_key
+  fox_cloud_username: !secret fox_cloud_username
+  fox_cloud_password: !secret fox_cloud_password
+  fox_cloud_expensive: false
+```
+
+Predbat uses the **v2 website and OpenAPI**, selecting the newest valid available sample for each status field. There is no legacy v1 website fallback.
+
+On supported inverter and datalogger firmware, the v2 website's live energy-flow feed updates about every five seconds. Predbat uses it for battery SoC, battery charge/discharge power, PV power, house load power and grid import/export power. Live net battery and grid power also update the existing `invbatpower` and `meterpower` sensors used by Fox automatic configuration. Battery power is positive for discharge; Fox meter power is positive for import and is inverted by the existing `grid_power_invert` configuration.
+
+A pause in live updates does not discard the last v2 values or suspend planning. Predbat compares each last v2 sample's estimated time (receipt time minus the reported freshness indicator) with the corresponding OpenAPI inverter timestamp. It retains v2 while that sample is newer, and selects OpenAPI once its sample is newer. An OpenAPI timestamp that is missing, invalid or implausibly in the future cannot establish precedence over a known dated v2 sample. Without v2 data, existing OpenAPI data handling applies. Missing or malformed incoming website values do not turn into zero or overwrite the last valid sample.
+
+The sensor `source` attribute identifies `fox_cloud` (current v2), `fox_cloud_cached` (last known v2), or `openapi`. Cached v2 fields expose `cached: true`. SoC and power expose `sample_time` and `sample_age_seconds` where timing is known; v2 timing is estimated and marked `sample_time_estimated: true`. Its `valid_until` describes live freshness only and does not block planning. Each v2 field is labelled cached after its own live validity ends or the connection fails. Updating one field does not refresh the age of missing fields. Source age alone no longer creates a Fox-specific planning or execution suspension. If both sources stop updating, planning can therefore continue using old cached values; their age remains visible.
+
+Cumulative energy counters remain on OpenAPI: the v2 socket does not carry them, and switching cumulative counter sources could distort energy history. Inverter settings and commands continue using OpenAPI. No additional configuration or dependencies are needed. The planning schedule and dashboard refresh interval remain unchanged.
+
+#### Polling and authentication (fox)
+
+The v2 website reader keeps its connection open and publishes incoming live updates (typically every five seconds), sending `getdata` after 30 seconds without a JSON message. Sending a request does not extend a reading's validity. The website reader does not wait for the OpenAPI polling timer before updating sensors. The portal's separate `preInfo` HTTP request is omitted because its necessity for the live stream has not been established.
+
+OpenAPI status polling follows `fox_poll_seconds`, which defaults to five minutes. Website updates are independent of that interval.
+
+The website reader uses one retry loop. It logs in when it needs a token and reuses that token after a working connection drops. A failed attempt that supplies no status clears the token so the next attempt logs in again. Retries start at five seconds, double up to five minutes after repeated failures, and reset after receiving status. Website tokens are held only in memory. OpenAPI authentication keeps its existing API-key/OAuth handling.
+
+V2 separates reading freshness from connection health. When a reading reaches its 30-second freshness limit, Predbat removes it from the live snapshot, publishes the newest available v2 or OpenAPI status, and requests an OpenAPI refresh on the next polling cycle. By default, it keeps the same socket open while valid responses arrive, including cached responses. Cached responses keep the connection alive without making any reading fresh. The initial response limit is 30 seconds; after a valid response, 120 seconds without another valid response triggers the existing reconnect loop. Socket clients respond to server pings automatically, without adding a client-generated heartbeat that the browser does not send.
+
+Set `fox_cloud_expensive: true` to try to sustain the frequent live feed. This mode reconnects when accepted readings reach their 30-second freshness limit, rather than waiting on a responsive but stale socket. A frame reporting five seconds of age normally expires 25 seconds after receipt. The existing retry loop reuses the token after a working connection and starts retries after five seconds. This increases connection traffic and is best effort: it cannot guarantee uninterrupted five-second telemetry or force an offline inverter to report. The flag does not change data validation, source selection, OpenAPI polling or inverter commands.
+
+Website failures retain the freshest known status while the retry loop reconnects. Repeated website login failures keep the normal OpenAPI polling interval. No website credentials means the existing OpenAPI behaviour is unchanged.
+
+A browser capture on 2026-11-04 showed roughly five minutes of five-second updates followed by occasional updated snapshots about five minutes apart on the same socket, despite successful idle requests and `preInfo` calls. Default mode follows that connection behaviour; keeping the socket open does not guarantee continuous live telemetry. V2's `lastUpdateDate` may be display text such as "Updated within 1 minute", not a machine-readable timestamp; it is not used as an independent sample clock.
+
+Failures and recovery appear in the normal Predbat log, for example:
+
+```text
+Warn: Fox: v2 website failed for SERIAL (HTTP 401); retaining freshest known status, retry in 5s
+Fox: v2 website status active for SERIAL (live flow)
+```
+
+Logs identify the version, failed stage, HTTP status or API error code where available, and the next fallback. Tokens, passwords and arbitrary server messages are excluded.
+
+The v2 feed reports a whole plant, so use website status for single-inverter plants. Predbat checks plant membership against the unfiltered device inventory and skips the website readers when multiple inverters share a plant; filtering a multi-inverter plant down to one inverter does not make its aggregate readings suitable. A complete inventory must be fetched after startup before website readers can start. Incomplete pages or unknown plant membership leave OpenAPI in use. Firmware and connection requirements are listed in [Fox ESS's live energy-flow documentation](https://fox-ess.tech/5-second-live-energy-flow-available-on-foxcloud-for-selected-devices/). The website protocol is unofficial and may change.
 
 ---
 

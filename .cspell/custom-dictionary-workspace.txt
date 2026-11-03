@@ -63,11 +63,14 @@ backpropagation
 backsteps
 backtest
 Basepath
+batchargepower
+batdischargepower
 bathighcap
 Batpred
 battemperature
 batteri
 batteryb
+batterys
 batusecap
 beforeunload
 bierner
@@ -292,6 +295,7 @@ getaddrinfo
 getaffinity
 getall
 getattr
+getdata
 getframe
 getmembers
 getrusage
@@ -582,6 +586,7 @@ predbat
 predbatsolcast
 predbatt
 predheat
+preinfo
 preseed
 preseeded
 prevs
@@ -844,6 +849,7 @@ worktree
 writeonly
 wrongsha
 WRONLY
+wsmaitian
 wwxxabcdefyyzz
 x1
 xaxis

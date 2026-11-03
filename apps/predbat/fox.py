@@ -32,6 +32,7 @@ from coordinator import inverter_record
 from mock_base import MockBase
 from oauth_mixin import OAuthMixin
 from utils import dp2, load_apps_yaml
+from fox_realtime import FoxCloudStream, fox_cloud_number, fox_sample_time, fox_latest_status_values
 
 # A decimal kW rating in a Fox deviceType, e.g. the 3.7 in H1-3.7-E-G2-WL or the 10.5 in KH10.5 (see FoxAPI.capacity_watts)
 FOX_DEVICE_TYPE_KW_RATING = re.compile(r"(\d+\.\d+)")
@@ -411,7 +412,20 @@ def groups_to_v3(groups, extra_extra_param=None):
 class FoxAPI(ComponentBase, OAuthMixin):
     """Fox API client."""
 
-    def initialize(self, key, automatic, automatic_ignore_pv=False, inverter_sn=None, auth_method=None, token_expires_at=None, token_hash=None, poll_seconds=FOX_REFRESH_REALTIME * 60):
+    def initialize(
+        self,
+        key,
+        automatic,
+        automatic_ignore_pv=False,
+        inverter_sn=None,
+        auth_method=None,
+        token_expires_at=None,
+        token_hash=None,
+        poll_seconds=FOX_REFRESH_REALTIME * 60,
+        cloud_username=None,
+        cloud_password=None,
+        cloud_expensive=False,
+    ):
         """Initialise the Fox API component"""
         self.key = key
         self.automatic = automatic
@@ -455,6 +469,13 @@ class FoxAPI(ComponentBase, OAuthMixin):
         self.rate_limit_errors_today = 0
         self.start_time_today = None
         self.last_midnight_utc = None
+        self.cloud_username = cloud_username
+        self.cloud_password = cloud_password
+        self.cloud_expensive = cloud_expensive
+        self.cloud_streams = {}
+        self.cloud_device_list = None
+        if bool(cloud_username) != bool(cloud_password):
+            self.log("Warn: Fox: Both fox_cloud_username and fox_cloud_password are required for live status; using OpenAPI")
 
         # Initialise OAuth support
         self._init_oauth(auth_method, key, token_expires_at, "fox_ess")
@@ -639,6 +660,8 @@ class FoxAPI(ComponentBase, OAuthMixin):
         if first or settings_refresh or production_refresh or realtime_refresh:
             await self.publish_data()
 
+        await self.start_cloud_streams()
+
         # Unconditional, once per cycle and outside any one-shot gate, so a transient failure is
         # retried rather than lost - see ComponentBase.refresh_discovery(), which owns the
         # compare/guard loop, and never raises. Placed after the device poll and publish_data()
@@ -656,6 +679,51 @@ class FoxAPI(ComponentBase, OAuthMixin):
             await self.automatic_config()
 
         return True
+
+    async def start_cloud_streams(self):
+        """Start one live stream per unambiguous single-inverter plant."""
+        if not getattr(self, "cloud_username", None) or not getattr(self, "cloud_password", None):
+            return
+        plants = {}
+        inventory = getattr(self, "cloud_device_list", self.device_list)
+        unknown_plant = False
+        for device in inventory or []:
+            sn = device.get("deviceSN")
+            plant = device.get("stationID") or self.device_detail.get(sn, {}).get("stationID")
+            if sn and plant:
+                plants.setdefault(str(plant), []).append(sn)
+            elif sn:
+                unknown_plant = True
+        selected = {device.get("deviceSN") for device in self.device_list}
+        eligible = {} if unknown_plant else {sns[0]: plant for plant, sns in plants.items() if len(sns) == 1 and sns[0] in selected}
+        for sn, stream in list(self.cloud_streams.items()):
+            if eligible.get(sn) != stream.plant_id or stream.task.done():
+                stream.task.cancel()
+                await asyncio.gather(stream.task, return_exceptions=True)
+                del self.cloud_streams[sn]
+        for sn, plant in eligible.items():
+            if sn not in self.cloud_streams:
+                stream = FoxCloudStream(self, sn, plant)
+                self.cloud_streams[sn] = stream
+                stream.task = asyncio.create_task(stream.run())
+
+    async def publish_cloud_data(self, device_sn, refresh=False):
+        """Publish live readings immediately, reverting to OpenAPI on feed failure."""
+        if refresh:
+            # Schedule an OpenAPI refresh on the next normal poll as well as
+            # immediately republishing its last successful snapshot below. A
+            # repeated login failure must not increase normal OpenAPI usage.
+            self.data_age.pop("device_values", None)
+        await self.publish_data(live_only=True)
+
+    async def final(self):
+        """Cancel live readers and close their sockets/sessions during shutdown."""
+        streams = getattr(self, "cloud_streams", {})
+        tasks = [stream.task for stream in streams.values() if stream.task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        streams.clear()
 
     def _data_age_minutes(self, key):
         """
@@ -1762,6 +1830,13 @@ class FoxAPI(ComponentBase, OAuthMixin):
         if result is None:
             return None
         devices = result.get("data", [])
+        # A serial filter must not turn a plant-wide feed into per-inverter
+        # telemetry. Keep the complete membership separately, in memory only.
+        total = fox_cloud_number(result.get("total"))
+        complete = total == len(devices) if total is not None else len(devices) < query["pageSize"]
+        self.cloud_device_list = devices.copy() if complete else None
+        if not complete and getattr(self, "cloud_username", None):
+            self.log("Warn: Fox: Incomplete device inventory; website status disabled until plant membership can be verified")
         # If self.inverter_sn_filter is set, keep only devices whose deviceSN is in that filter
         if self.inverter_sn_filter:
             devices = [device for device in devices if device.get("deviceSN", "") in self.inverter_sn_filter]
@@ -1933,16 +2008,20 @@ class FoxAPI(ComponentBase, OAuthMixin):
             record_api_call("fox", False, "server_error")
         return None, False
 
-    async def publish_data(self):
+    async def publish_data(self, live_only=False):
         """
         Publish data to HA using dashboard_item
         """
+
+        # Keep the persisted OpenAPI snapshot intact so fallback never reuses
+        # live values, and delayed per-battery SoCs cannot replace a live SoC.
+        device_values = {sn: values.copy() for sn, values in self.device_values.items()}
 
         # Create entity name prefix
         entity_name_sensor = f"sensor.{self.prefix}_fox"
         entity_name_number = f"number.{self.prefix}_fox"
         entity_name_select = f"select.{self.prefix}_fox"
-        for device in self.device_list:
+        for device in [] if live_only else self.device_list:
             sn = device.get("deviceSN", None)
             detail = self.device_detail.get(sn, {})
             hasPV = detail.get("hasPV", False)
@@ -1970,7 +2049,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
             reserve_min = int(self.fdsoc_min.get(sn, 10))
             self.dashboard_item(entity_name_sensor + "_" + sn.lower() + "_battery_reserve_min", state=reserve_min, attributes={"friendly_name": f"Fox {sn} Battery Reserve Min", "unit_of_measurement": "%"}, app="fox")
 
-            soh_raw = self.device_values.get(sn, {}).get("SOH", {}).get("value", 100.0)
+            soh_raw = device_values.get(sn, {}).get("SOH", {}).get("value", 100.0)
             try:
                 soh_fraction = round(float(soh_raw) / 100.0, 4)
             except (ValueError, TypeError):
@@ -1983,12 +2062,13 @@ class FoxAPI(ComponentBase, OAuthMixin):
             )
 
         # If we have soc_x sensors then sum them for total soc and store as _soc so that Predbat gets a single SOC value
-        for sn in self.device_values:
+        for sn in device_values:
             soc_total = 0
             soc_total_count = 0
-            for item_name in self.device_values[sn]:
+            soc_timestamps = []
+            for item_name in device_values[sn]:
                 if item_name.lower().startswith("soc_"):
-                    item = self.device_values[sn][item_name]
+                    item = device_values[sn][item_name]
                     soc = item.get("value", None)
                     try:
                         soc = float(soc)
@@ -1997,18 +2077,29 @@ class FoxAPI(ComponentBase, OAuthMixin):
                     if soc is not None and soc > 0:
                         soc_total += soc
                         soc_total_count += 1
+                        soc_timestamps.append(item.get("timestamp", ""))
             if soc_total_count > 0:
                 # Remove the SOC dictionary key (any case) otherwise we might create a duplicate (different case)
-                for key in list(self.device_values[sn].keys()):
+                for key in list(device_values[sn].keys()):
                     if key.lower() == "soc":
-                        del self.device_values[sn][key]
+                        del device_values[sn][key]
                 # Add total SOC
-                self.device_values[sn]["SoC"] = {"name": "State of Charge Total", "unit": "%", "value": round(soc_total / soc_total_count, 0)}
+                oldest = min(soc_timestamps, key=lambda stamp: fox_sample_time(stamp, self.local_tz) if fox_sample_time(stamp, self.local_tz) is not None else float("-inf"))
+                device_values[sn]["SoC"] = {"name": "State of Charge Total", "unit": "%", "value": round(soc_total / soc_total_count, 0), "timestamp": oldest}
+
+        cloud_variables = {}
+        for sn, stream in getattr(self, "cloud_streams", {}).items():
+            cloud_variables[sn] = {key.lower() for key in stream.values}
+            device_values[sn] = fox_latest_status_values(device_values.get(sn, {}), stream.values, {key.casefold() for key in stream.current_values()}, self.local_tz, time.time())
 
         # Publish device values
-        for sn in self.device_values:
-            for item_name in self.device_values[sn]:
-                item = self.device_values[sn][item_name]
+        for sn in device_values:
+            if live_only and not cloud_variables.get(sn):
+                continue
+            for item_name in device_values[sn]:
+                if live_only and item_name.lower() not in cloud_variables[sn]:
+                    continue
+                item = device_values[sn][item_name]
                 state = item.get("value", None)
                 name = item.get("name", item_name)
                 units = item.get("unit", "")
@@ -2016,7 +2107,12 @@ class FoxAPI(ComponentBase, OAuthMixin):
                 attributes = {
                     "unit_of_measurement": units,
                     "friendly_name": f"Fox {sn} {name}",
+                    "source": item.get("source", "openapi"),
+                    "timestamp": item.get("timestamp", ""),
                 }
+                for key in ("valid_until", "sample_time", "sample_age_seconds", "sample_time_estimated", "cached", "website_version", "sample_age_known"):
+                    if key in item:
+                        attributes[key] = item[key]
                 # Set device and state class
                 if units in ["kWh", "Wh"]:
                     attributes["device_class"] = "energy"
@@ -2033,8 +2129,11 @@ class FoxAPI(ComponentBase, OAuthMixin):
                 self.dashboard_item(entity_id, state=state, attributes=attributes, app="fox")
 
             # Publish battery flow sensor
-            charge_power = self.device_values.get(sn, {}).get("batChargePower", {}).get("value", 0)
-            discharge_power = self.device_values.get(sn, {}).get("batDischargePower", {}).get("value", 0)
+            charge_power = device_values.get(sn, {}).get("batChargePower", {}).get("value", 0)
+            discharge_power = device_values.get(sn, {}).get("batDischargePower", {}).get("value", 0)
+            battery_unavailable = charge_power is None and discharge_power is None
+            if getattr(self, "cloud_username", None) and getattr(self, "cloud_password", None):
+                battery_unavailable = charge_power is None or discharge_power is None
 
             try:
                 charge_power = float(charge_power) if charge_power is not None else 0.0
@@ -2044,7 +2143,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
                 discharge_power = 0.0
 
             # Calculate battery flow: positive = discharge, negative = charge
-            battery_flow = discharge_power - charge_power
+            battery_flow = None if battery_unavailable else discharge_power - charge_power
 
             self.dashboard_item(
                 entity_name_sensor + "_" + sn.lower() + "_battery_flow",
@@ -2054,9 +2153,10 @@ class FoxAPI(ComponentBase, OAuthMixin):
             )
 
             # Publish schedule settings
-            await self.publish_schedule_settings_ha(sn)
+            if not live_only:
+                await self.publish_schedule_settings_ha(sn)
 
-        for sn in self.device_settings:
+        for sn in [] if live_only else self.device_settings:
             # Device must have battery to publish settings
             if not self.device_detail.get(sn, {}).get("hasBattery", False):
                 continue
@@ -2090,7 +2190,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
                 self.dashboard_item(entity_id, state=state, attributes=attributes, app="fox")
 
         # Publish month and today totals
-        for sn in self.device_production_month:
+        for sn in [] if live_only else self.device_production_month:
             today = datetime.now(self.local_tz).day
 
             for item in self.device_production_month[sn]:

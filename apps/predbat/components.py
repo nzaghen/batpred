@@ -365,6 +365,9 @@ COMPONENT_LIST = {
                 "secret": True,
                 "config": "fox_key",
             },
+            "cloud_username": {"required": False, "secret": True, "config": "fox_cloud_username"},
+            "cloud_password": {"required": False, "secret": True, "config": "fox_cloud_password"},
+            "cloud_expensive": {"required": False, "default": False, "config": "fox_cloud_expensive"},
             "automatic": {
                 "required": False,
                 "default": False,
