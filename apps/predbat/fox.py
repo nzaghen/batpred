@@ -198,6 +198,29 @@ class FoxCloudError(ValueError):
     """A website failure containing only a controlled, credential-free reason."""
 
 
+def fox_cloud_planner_values(values):
+    """Add signed power readings used by the planner from website-only flow pairs."""
+    values = values.copy()
+    names = {key.casefold(): key for key in values}
+    for target, positive, negative, name in (
+        ("invBatPower", "batDischargePower", "batChargePower", "Battery Power"),
+        ("meterPower", "gridConsumptionPower", "feedinPower", "Grid Power"),
+    ):
+        if target.casefold() in names:
+            continue
+        first = values.get(names.get(positive.casefold()))
+        second = values.get(names.get(negative.casefold()))
+        if not isinstance(first, dict) or not isinstance(second, dict):
+            continue
+        first_power = fox_cloud_power({"power": first})
+        second_power = fox_cloud_power({"power": second})
+        if first_power is not None and second_power is not None and min(first_power, second_power) >= 0:
+            # Fox's existing bindings expect discharge-positive battery power and
+            # import-positive meter power; inverter.py inverts the latter.
+            values[target] = {**first, "value": first_power - second_power, "name": name, "unit": "kW"}
+    return values
+
+
 def fox_cloud_failure(error):
     """Describe a failure without exposing server messages or token-bearing URLs."""
     if isinstance(error, FoxCloudError):
@@ -2390,8 +2413,8 @@ class FoxAPI(ComponentBase, OAuthMixin):
 
         cloud_variables = {}
         for sn, stream in getattr(self, "cloud_streams", {}).items():
-            live = stream.current_values()
-            observed = {**stream.observed_values, **stream.values}
+            live = fox_cloud_planner_values(stream.current_values())
+            observed = fox_cloud_planner_values({**stream.observed_values, **stream.values})
             cloud_variables[sn] = {key.lower() for key in observed}
             values = device_values.setdefault(sn, {})
             for variable, item in observed.items():

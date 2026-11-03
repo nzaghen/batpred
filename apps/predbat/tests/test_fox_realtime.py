@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
-from fox import FoxAPI, FoxCloudStream, FoxCloudError, FOX_CLOUD_MAX_AGE, FOX_CACHE_KEYS, FOX_SETTINGS_CACHE_VERSION, fox_cloud_headers, fox_cloud_values, fox_v1_values, fox_cloud_failure
+from fox import FoxAPI, FoxCloudStream, FoxCloudError, FOX_CLOUD_MAX_AGE, FOX_CACHE_KEYS, FOX_SETTINGS_CACHE_VERSION, fox_cloud_headers, fox_cloud_values, fox_cloud_planner_values, fox_v1_values, fox_cloud_failure
 from tests.test_fox_api import MockFoxAPIWithRequests, MockFoxAPIWithRunTracking
 
 
@@ -57,6 +57,22 @@ def context(value):
 
 class TestFoxLiveMapping(unittest.TestCase):
     """Check the actual portal field names, units, direction and freshness."""
+
+    def test_signed_planner_power_requires_complete_valid_live_pairs(self):
+        """Never combine missing live legs with delayed OpenAPI values or invent zero."""
+        base = {"batChargePower": {"value": 2000, "unit": "W"}, "batDischargePower": {"value": 0, "unit": "kW"}}
+        original = deepcopy(base)
+        self.assertEqual(fox_cloud_planner_values(base)["invBatPower"]["value"], -2)
+        self.assertEqual(base, original)
+        for bad in (None, {"value": 1, "unit": "MW"}, {"value": float("nan"), "unit": "kW"}, {"value": -1, "unit": "kW"}):
+            with self.subTest(bad=bad):
+                values = dict(base, batDischargePower=bad)
+                self.assertNotIn("invBatPower", fox_cloud_planner_values(values))
+
+    def test_native_live_net_power_takes_priority(self):
+        """Retain direct v1 net-power telemetry, including its case and units."""
+        values = {"INVBATPOWER": {"value": -1234, "unit": "W"}, "batChargePower": {"value": 2, "unit": "kW"}, "batDischargePower": {"value": 0, "unit": "kW"}}
+        self.assertEqual(fox_cloud_planner_values(values), values)
 
     def test_login_signature_matches_portal_wasm(self):
         """Pin a signature generated independently with Fox's original WASM."""
@@ -125,6 +141,86 @@ class TestFoxLiveMapping(unittest.TestCase):
 
 class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
     """Exercise real publication, stale fallback and asynchronous stream lifecycle."""
+
+    async def test_live_flow_reaches_all_automatically_bound_planner_sensors(self):
+        """Auto-configured planner inputs receive live SoC and correctly signed power."""
+        fox = make_fox()
+        fox.device_detail["SN1"].update(hasPV=True, capacity=8, function={"scheduler": True})
+        await fox.automatic_config()
+        stream = FoxCloudStream(fox, "SN1", "plant1")
+        fox.cloud_streams["SN1"] = stream
+        for battery_direction, grid_direction, battery_watts, grid_watts in ((1, 2, -2000, -300), (2, 1, 2000, 300)):
+            with self.subTest(battery_direction=battery_direction, grid_direction=grid_direction):
+                frame = live_frame(soc=0)
+                frame["result"]["node"]["bat"]["charge"] = battery_direction
+                frame["result"]["node"]["grid"]["gridStatus"] = grid_direction
+                values, age = fox_cloud_values(frame)
+                await stream.accept_values(values, age, "v2")
+                for argument, expected in {"soc_percent": 0, "battery_power": battery_watts, "grid_power": grid_watts, "pv_power": 3500, "load_power": 1800}.items():
+                    reading = fox.dashboard_items[fox.args_set[argument][0]]
+                    value = reading["state"] * (1000 if reading["attributes"]["unit_of_measurement"] == "kW" else 1)
+                    if argument == "grid_power" and fox.args_set["grid_power_invert"][0]:
+                        value = -value
+                    self.assertEqual(value, expected, argument)
+                    self.assertEqual(reading["attributes"]["source"], "fox_cloud")
+                    self.assertEqual(reading["attributes"]["website_version"], "v2")
+                    self.assertTrue(reading["attributes"]["sample_age_known"])
+
+    async def test_live_net_power_survives_openapi_poll_and_expires_to_baseline(self):
+        """Fresh website net power beats an OpenAPI poll without changing its cache."""
+        fox = make_fox()
+        fox.device_values["SN1"].update(invBatPower={"value": 900, "unit": "W"}, meterPower={"value": -600, "unit": "W"})
+        baseline = deepcopy(fox.device_values)
+        stream = FoxCloudStream(fox, "SN1", "plant1")
+        fox.cloud_streams["SN1"] = stream
+        stream.values, _ = fox_cloud_values(live_frame())
+        stream.observed_values.update(stream.values)
+        stream.expires_at = float("inf")
+        await fox.publish_data()
+        for suffix, expected in (("invbatpower", -2), ("meterpower", 0.3)):
+            self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_" + suffix]["state"], expected)
+        self.assertEqual(fox.device_values, baseline)
+        stream.expires_at = 0
+        await fox.publish_cloud_data("SN1")
+        for suffix, expected in (("invbatpower", 900), ("meterpower", -600)):
+            reading = fox.dashboard_items["sensor.predbat_fox_sn1_" + suffix]
+            self.assertEqual(reading["state"], expected)
+            self.assertEqual(reading["attributes"]["unit_of_measurement"], "W")
+            self.assertEqual(reading["attributes"]["source"], "openapi")
+            self.assertNotIn("website_version", reading["attributes"])
+
+    async def test_missing_live_net_power_does_not_reuse_an_old_frame(self):
+        """Partial website frames fall back per field, and live-only fields expire."""
+        fox = make_fox()
+        stream = FoxCloudStream(fox, "SN1", "plant1")
+        fox.cloud_streams["SN1"] = stream
+        stream.values, _ = fox_cloud_values(live_frame())
+        stream.observed_values.update(stream.values)
+        stream.expires_at = float("inf")
+        await fox.publish_cloud_data("SN1")
+        frame = live_frame()
+        frame["result"]["node"]["bat"]["charge"] = 3
+        frame["result"]["node"]["grid"]["gridStatus"] = 3
+        stream.values, _ = fox_cloud_values(frame)
+        await fox.publish_cloud_data("SN1")
+        for suffix in ("invbatpower", "meterpower"):
+            reading = fox.dashboard_items["sensor.predbat_fox_sn1_" + suffix]
+            self.assertIsNone(reading["state"])
+            self.assertEqual(reading["attributes"]["source"], "openapi")
+
+    async def test_v1_flow_supplies_signed_planner_power_with_age_metadata(self):
+        """Legacy flow power reaches existing planner bindings without a freshness claim."""
+        fox = make_fox()
+        stream = FoxCloudStream(fox, "SN1", "plant1")
+        fox.cloud_streams["SN1"] = stream
+        message = {"msgType": "data", "sequence": "flow", "data": {"invBatPower": {"value": 1200, "unit": "W"}, "gridConsumptionPower": {"value": 0, "unit": "W"}, "feedinPower": {"value": 0.7, "unit": "kW"}}}
+        await stream.accept_values(fox_v1_values(message, {}), 0, "v1")
+        for suffix, expected in (("invbatpower", 1.2), ("meterpower", -0.7)):
+            reading = fox.dashboard_items["sensor.predbat_fox_sn1_" + suffix]
+            self.assertEqual(reading["state"], expected)
+            self.assertEqual(reading["attributes"]["source"], "fox_cloud_v1")
+            self.assertEqual(reading["attributes"]["website_version"], "v1")
+            self.assertFalse(reading["attributes"]["sample_age_known"])
 
     async def test_live_soc_wins_without_poisoning_openapi_cache(self):
         """Old per-battery SoC and later OpenAPI polls cannot overwrite live SoC."""
@@ -266,7 +362,7 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         stream.expires_at = float("inf")
         fox.publish_schedule_settings_ha = AsyncMock()
         await fox.publish_cloud_data("SN1")
-        self.assertEqual(len(fox.dashboard_items), 8)
+        self.assertEqual(len(fox.dashboard_items), 10)
         self.assertNotIn("sensor.predbat_fox_sn1_info", fox.dashboard_items)
         self.assertNotIn("sensor.predbat_fox_sn1_feedin", fox.dashboard_items)
         fox.publish_schedule_settings_ha.assert_not_awaited()
