@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
-from fox import FoxAPI, FoxCloudStream, FOX_CLOUD_MAX_AGE, fox_cloud_headers, fox_cloud_values, fox_cloud_planner_values
+from fox import FoxAPI, FoxCloudStream, FOX_CLOUD_MAX_AGE, fox_cloud_headers, fox_cloud_values
 from tests.test_fox_api import MockFoxAPIWithRequests
 
 
@@ -61,20 +61,15 @@ class TestFoxLiveMapping(unittest.TestCase):
     """Check the actual portal field names, units, direction and freshness."""
 
     def test_signed_planner_power_requires_complete_valid_live_pairs(self):
-        """Never combine missing live legs with delayed OpenAPI values or invent zero."""
-        base = {"batChargePower": {"value": 2000, "unit": "W"}, "batDischargePower": {"value": 0, "unit": "kW"}}
-        original = deepcopy(base)
-        self.assertEqual(fox_cloud_planner_values(base)["invBatPower"]["value"], -2)
-        self.assertEqual(base, original)
-        for bad in (None, {"value": 1, "unit": "MW"}, {"value": float("nan"), "unit": "kW"}, {"value": -1, "unit": "kW"}):
+        """Map a valid node directly; invalid power cannot create any battery power sensor."""
+        self.assertEqual(fox_cloud_values(live_frame())[0]["invBatPower"]["value"], -2)
+        for bad in (None, {"value": 1, "unit": "MW"}, {"value": float("nan"), "unit": "kW"}, {"value": -1, "unit": "kW"}, {"value": 1e308, "unit": "kW"}):
             with self.subTest(bad=bad):
-                values = dict(base, batDischargePower=bad)
-                self.assertNotIn("invBatPower", fox_cloud_planner_values(values))
-
-    def test_native_live_net_power_takes_priority(self):
-        """Retain direct signed net-power telemetry, including its case and units."""
-        values = {"INVBATPOWER": {"value": -1234, "unit": "W"}, "batChargePower": {"value": 2, "unit": "kW"}, "batDischargePower": {"value": 0, "unit": "kW"}}
-        self.assertEqual(fox_cloud_planner_values(values), values)
+                frame = live_frame()
+                frame["result"]["node"]["bat"]["power"] = bad
+                values, _ = fox_cloud_values(frame)
+                for variable in ("invBatPower", "batChargePower", "batDischargePower"):
+                    self.assertNotIn(variable, values)
 
     def test_login_signature_matches_portal_wasm(self):
         """Pin a signature generated independently with Fox's original WASM."""
@@ -171,19 +166,20 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
     async def test_live_net_power_survives_openapi_poll_and_expires_to_baseline(self):
         """Fresh website net power beats an OpenAPI poll without changing its cache."""
         fox = make_fox()
-        stamp = datetime.now(timezone.utc).isoformat()
+        stamp = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
         fox.device_values["SN1"].update(invBatPower={"value": 900, "unit": "W", "timestamp": stamp}, meterPower={"value": -600, "unit": "W", "timestamp": stamp})
         baseline = deepcopy(fox.device_values)
         stream = FoxCloudStream(fox, "SN1", "plant1")
         fox.cloud_streams["SN1"] = stream
-        stream.values, _ = fox_cloud_values(live_frame())
-        stream.observed_values.update(stream.values)
-        stream.expires_at = float("inf")
+        await stream.accept_values(*fox_cloud_values(live_frame()))
         await fox.publish_data()
         for suffix, expected in (("invbatpower", -2), ("meterpower", 0.3)):
             self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_" + suffix]["state"], expected)
         self.assertEqual(fox.device_values, baseline)
         stream.expires_at = 0
+        stamp = datetime.now(timezone.utc).isoformat()
+        for item in fox.device_values["SN1"].values():
+            item["timestamp"] = stamp
         await fox.publish_cloud_data("SN1")
         for suffix, expected in (("invbatpower", 900), ("meterpower", -600)):
             reading = fox.dashboard_items["sensor.predbat_fox_sn1_" + suffix]
@@ -197,19 +193,19 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         fox = make_fox()
         stream = FoxCloudStream(fox, "SN1", "plant1")
         fox.cloud_streams["SN1"] = stream
-        stream.values, _ = fox_cloud_values(live_frame())
-        stream.observed_values.update(stream.values)
-        stream.expires_at = float("inf")
-        await fox.publish_cloud_data("SN1")
+        await stream.accept_values(*fox_cloud_values(live_frame()))
+        retained = deepcopy(stream.values["invBatPower"])
         frame = live_frame()
         frame["result"]["node"]["bat"]["charge"] = 3
         frame["result"]["node"]["grid"]["gridStatus"] = 3
-        stream.values, _ = fox_cloud_values(frame)
-        await fox.publish_cloud_data("SN1")
+        await stream.accept_values(*fox_cloud_values(frame))
         for suffix in ("invbatpower", "meterpower"):
             reading = fox.dashboard_items["sensor.predbat_fox_sn1_" + suffix]
             self.assertEqual(reading["state"], -2 if suffix == "invbatpower" else 0.3)
-        self.assertEqual(reading["attributes"]["source"], "fox_cloud_cached")
+        self.assertEqual(stream.values["invBatPower"], retained)
+        with patch("fox.time.monotonic", return_value=float("inf")):
+            await fox.publish_cloud_data("SN1")
+        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_meterpower"]["attributes"]["source"], "fox_cloud_cached")
 
     async def test_live_soc_wins_without_poisoning_openapi_cache(self):
         """Old per-battery SoC and later OpenAPI polls cannot overwrite live SoC."""
@@ -217,9 +213,7 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         stream = FoxCloudStream(fox, "SN1", "plant1")
         fox.cloud_streams["SN1"] = stream
         original = deepcopy(fox.device_values)
-        stream.values, _ = fox_cloud_values(live_frame(soc=0))
-        stream.observed_values.update(stream.values)
-        stream.expires_at = float("inf")
+        await stream.accept_values(*fox_cloud_values(live_frame(soc=0)))
         await fox.publish_data()
         self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 0)
         self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["attributes"]["source"], "fox_cloud")
@@ -232,8 +226,8 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 0)
         stream.expires_at = 0
         await fox.publish_cloud_data("SN1")
-        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 42)
-        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["attributes"]["source"], "openapi")
+        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 0)
+        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["attributes"]["source"], "fox_cloud_cached")
         self.assertNotIn("device_values", fox.data_age)
 
     async def test_live_values_expire_per_frame_and_per_device(self):
@@ -242,9 +236,8 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         fox.device_values["SN2"] = {"SoC": {"value": 87, "name": "SoC", "unit": "%", "timestamp": datetime.now(timezone.utc).isoformat()}}
         stream = FoxCloudStream(fox, "SN1", "plant1")
         fox.cloud_streams["SN1"] = stream
-        stream.values, _ = fox_cloud_values(live_frame(soc=None))
-        stream.expires_at = 125
         with patch("fox.time.monotonic", return_value=100):
+            await stream.accept_values(*fox_cloud_values(live_frame(soc=None)))
             await fox.publish_data()
             self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 42)
             self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn2_soc"]["state"], 87)
@@ -324,21 +317,21 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         fox = make_fox()
         stream = FoxCloudStream(fox, "SN1", "plant1")
         fox.cloud_streams["SN1"] = stream
-        stream.values, _ = fox_cloud_values(live_frame())
-        stream.observed_values.update(stream.values)
-        stream.expires_at = float("inf")
+        await stream.accept_values(*fox_cloud_values(live_frame()))
+        retained = deepcopy(stream.values)
         stream.login = AsyncMock(return_value="secret-token")
         stream.listen = AsyncMock(side_effect=[ConnectionError("wss://host?token=secret-token"), asyncio.CancelledError()])
 
         with patch("fox.aiohttp.ClientSession", return_value=context(MagicMock())), patch("fox.asyncio.sleep", new_callable=AsyncMock) as sleep:
             with self.assertRaises(asyncio.CancelledError):
                 await stream.run()
-        self.assertEqual(stream.values, {})
+        self.assertEqual(stream.values, retained)
+        self.assertFalse(stream.current_values())
         self.assertEqual(stream.login.await_count, 2)
         self.assertEqual(fox.key, "test_api_key")
         self.assertNotIn("secret-token", str(fox.log_messages))
         self.assertIn("retaining freshest known status", str(fox.log_messages))
-        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 42)
+        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 54.5)
         sleep.assert_awaited_once_with(5)
 
     async def test_live_publication_sends_only_flow_sensors(self):
@@ -346,21 +339,18 @@ class TestFoxLiveFallback(unittest.IsolatedAsyncioTestCase):
         fox = make_fox()
         stream = FoxCloudStream(fox, "SN1", "plant1")
         fox.cloud_streams["SN1"] = stream
-        stream.values, _ = fox_cloud_values(live_frame())
-        stream.observed_values.update(stream.values)
-        stream.expires_at = float("inf")
+        await stream.accept_values(*fox_cloud_values(live_frame()))
         fox.publish_schedule_settings_ha = AsyncMock()
         await fox.publish_cloud_data("SN1")
         self.assertEqual(len(fox.dashboard_items), 10)
         self.assertNotIn("sensor.predbat_fox_sn1_info", fox.dashboard_items)
         self.assertNotIn("sensor.predbat_fox_sn1_feedin", fox.dashboard_items)
         fox.publish_schedule_settings_ha.assert_not_awaited()
-        stream.values = {}
         stream.expires_at = 0
         await fox.publish_cloud_data("SN1", refresh=True)
         self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_pvpower"]["state"], 3.5)
         self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_battery_flow"]["state"], -2)
-        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 42)
+        self.assertEqual(fox.dashboard_items["sensor.predbat_fox_sn1_soc"]["state"], 54.5)
 
     async def test_repeated_login_failure_preserves_openapi_poll_cadence(self):
         """Bad website credentials must not make OpenAPI refresh on every retry."""

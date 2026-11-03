@@ -98,8 +98,6 @@ FOX_REFRESH_REALTIME = 5  # Real time monitoring data
 # promote its cached/keepalive frames to current readings, even while connected.
 FOX_CLOUD_MAX_AGE = 30
 FOX_CLOUD_RECOVERY_SECONDS = 120
-FOX_SIGNED_POWER_FIELDS = {"invbatpower", "meterpower", "meterpower2"}
-FOX_POWER_FIELDS = FOX_SIGNED_POWER_FIELDS | {field.casefold() for field in ("batChargePower", "batDischargePower", "gridConsumptionPower", "feedinPower", "pvPower", "loadsPower", "generationPower", "epsPower")}
 FOX_CLOUD_LOGIN_PATH = "/basic/v0/user/login"
 FOX_CLOUD_WS_PATH = "/dew/v0/wsmaitian"
 FOX_CLOUD_PREINFO_PATH = "/dew/w/plant/flow/preInfo"
@@ -151,13 +149,7 @@ def fox_sample_time(value, local_tz):
     try:
         parsed = datetime.fromisoformat(value)
         if parsed.tzinfo is None:
-            if hasattr(local_tz, "localize"):
-                parsed = local_tz.localize(parsed, is_dst=None)
-            else:
-                first, second = parsed.replace(tzinfo=local_tz, fold=0), parsed.replace(tzinfo=local_tz, fold=1)
-                if first.utcoffset() != second.utcoffset():
-                    return None
-                parsed = first
+            parsed = local_tz.localize(parsed, is_dst=None)
         return parsed.timestamp()
     except (ValueError, TypeError, OverflowError, pytz.InvalidTimeError):
         return None
@@ -167,43 +159,31 @@ def fox_latest_status_values(openapi, website, live_variables, local_tz, now):
     """Choose the newest valid status per field, retaining v2 samples through live gaps."""
     values = openapi.copy()
     names = {key.casefold(): key for key in values}
-    # Some devices report separate power legs but omit the net planner aliases.
-    derived = fox_cloud_planner_values(values)
-    for key in ("invBatPower", "meterPower"):
-        if key.casefold() not in names and key in derived:
-            values[key] = derived[key]
-            names[key.casefold()] = key
-    # Keep flow-card legs consistent when OpenAPI supplies only a newer net value.
+    # A newer API net reading also supplies missing directional flow sensors.
     for net, positive, negative in (("invbatpower", "batDischargePower", "batChargePower"), ("meterpower", "gridConsumptionPower", "feedinPower")):
         item = values.get(names.get(net), {})
-        if not fox_valid_planner_value(net, item):
-            continue
         power = fox_cloud_power({"power": item})
-        for key, direction in ((positive, 1), (negative, -1)):
-            if key.casefold() not in names:
-                values[key] = {**item, "value": max(direction * power, 0), "unit": "kW", "name": key}
-                names[key.casefold()] = key
+        if power is not None:
+            for variable, sign in ((positive, 1), (negative, -1)):
+                if variable.casefold() not in names:
+                    values[variable] = {**item, "value": max(sign * power, 0), "unit": "kW", "name": variable}
+                    names[variable.casefold()] = variable
     for variable, item in website.items():
         key = variable.casefold()
         original_key = names.get(key)
         original = values.get(original_key, {})
         api_time = fox_sample_time(original.get("timestamp"), local_tz)
-        if api_time is not None and api_time > now + 60:
-            api_time = None
-        website_time = fox_cloud_number(item.get("sample_time"))
-        use_website = fox_valid_planner_value(variable, item) and (not fox_valid_planner_value(variable, original) or (website_time is not None and (api_time is None or website_time >= api_time)) or (website_time is None and key in live_variables))
-        if use_website:
-            if original_key is not None:
-                del values[original_key]
+        number = fox_cloud_number(original.get("value"))
+        valid = number is not None and original.get("unit") in (("%",) if key == "soc" else ("W", "kW"))
+        if valid:
+            valid = 0 <= number <= 100 if key == "soc" else math.isfinite(number * 1000) and (key in ("invbatpower", "meterpower") or number >= 0)
+        if valid and api_time is not None and item["sample_time"] < api_time <= now + 60:
+            item, sampled_at = original, api_time
+        else:
             cached = key not in live_variables
-            values[variable] = {**item, "source": "fox_cloud_cached" if cached else "fox_cloud", "cached": cached}
-    for key, item in list(values.items()):
-        if key.casefold() not in FOX_POWER_FIELDS and key.casefold() != "soc":
-            continue
-        sampled_at = fox_cloud_number(item.get("sample_time")) if item.get("source") in ("fox_cloud", "fox_cloud_cached") else fox_sample_time(item.get("timestamp"), local_tz)
-        if sampled_at is not None and sampled_at > now + 60:
-            sampled_at = None
-        values[key] = {**item, "sample_time": sampled_at, "sample_age_seconds": max(0, now - sampled_at) if sampled_at is not None else None}
+            item = {**item, "source": "fox_cloud_cached" if cached else "fox_cloud", "cached": cached}
+            sampled_at = item["sample_time"]
+        values[original_key or variable] = {**item, "sample_time": sampled_at, "sample_age_seconds": max(0, now - sampled_at)}
     return values
 
 
@@ -216,7 +196,7 @@ def fox_cloud_power(node):
         return None
     value = fox_cloud_number(power.get("value"))
     unit = power.get("unit")
-    if value is None or unit not in ("W", "kW"):
+    if value is None or unit not in ("W", "kW") or not math.isfinite(value * (1000 if unit == "kW" else 1)):
         return None
     return value / 1000.0 if unit == "W" else value
 
@@ -248,6 +228,7 @@ def fox_cloud_values(message):
         if power is not None and power >= 0 and direction in ("1", "2"):
             values["batChargePower"] = {"value": power if direction == "1" else 0.0, "name": "Charge Power", "unit": "kW"}
             values["batDischargePower"] = {"value": power if direction == "2" else 0.0, "name": "Discharge Power", "unit": "kW"}
+            values["invBatPower"] = {"value": power if direction == "2" else -power, "name": "Battery Power", "unit": "kW"}
     for key, variable, name in [("solar", "pvPower", "PV Power"), ("load", "loadsPower", "Load Power")]:
         power = fox_cloud_power(node.get(key))
         if power is not None and power >= 0:
@@ -260,6 +241,7 @@ def fox_cloud_values(message):
     if power is not None and power >= 0 and direction in ("1", "2"):
         values["gridConsumptionPower"] = {"value": power if direction == "2" else 0.0, "name": "Grid Consumption Power", "unit": "kW"}
         values["feedinPower"] = {"value": power if direction == "1" else 0.0, "name": "Feed-in Power", "unit": "kW"}
+        values["meterPower"] = {"value": power if direction == "2" else -power, "name": "Grid Power", "unit": "kW"}
     for item in values.values():
         item.update({"timestamp": result.get("lastUpdateDate", ""), "source": "fox_cloud"})
     return values, age
@@ -267,45 +249,6 @@ def fox_cloud_values(message):
 
 class FoxCloudError(ValueError):
     """A website failure containing only a controlled, credential-free reason."""
-
-
-def fox_valid_planner_value(variable, item):
-    """Reject malformed SoC and power instead of handing them to planner defaults."""
-    if not isinstance(item, dict):
-        return False
-    value = fox_cloud_number(item.get("value"))
-    if value is None:
-        return False
-    variable = variable.casefold()
-    if variable == "soc" or variable.startswith("soc_"):
-        return item.get("unit") == "%" and 0 <= value <= 100
-    if variable in FOX_POWER_FIELDS:
-        unit = item.get("unit")
-        return unit in ("W", "kW") and math.isfinite(value * (1000 if unit == "kW" else 1)) and (variable in FOX_SIGNED_POWER_FIELDS or value >= 0)
-    return True
-
-
-def fox_cloud_planner_values(values):
-    """Add signed power readings used by the planner from website-only flow pairs."""
-    values = {key: item for key, item in values.items() if fox_valid_planner_value(key, item)}
-    names = {key.casefold(): key for key in values}
-    for target, positive, negative, name in (
-        ("invBatPower", "batDischargePower", "batChargePower", "Battery Power"),
-        ("meterPower", "gridConsumptionPower", "feedinPower", "Grid Power"),
-    ):
-        if target.casefold() in names:
-            continue
-        first = values.get(names.get(positive.casefold()))
-        second = values.get(names.get(negative.casefold()))
-        if not isinstance(first, dict) or not isinstance(second, dict):
-            continue
-        first_power = fox_cloud_power({"power": first})
-        second_power = fox_cloud_power({"power": second})
-        if first_power is not None and second_power is not None and min(first_power, second_power) >= 0:
-            # Fox's existing bindings expect discharge-positive battery power and
-            # import-positive meter power; inverter.py inverts the latter.
-            values[target] = {**first, "value": first_power - second_power, "name": name, "unit": "kW"}
-    return values
 
 
 def fox_cloud_failure(error):
@@ -328,7 +271,6 @@ class FoxCloudStream:
         self.device_sn = device_sn
         self.plant_id = plant_id
         self.values = {}
-        self.observed_values = {}
         self.expires_at = 0
         self.task = None
         self.active_version = None
@@ -336,7 +278,7 @@ class FoxCloudStream:
 
     def current_values(self):
         """Return only readings that are still fresh according to inverter age."""
-        return self.values if time.monotonic() < self.expires_at else {}
+        return {key: item for key, item in self.values.items() if item["valid_until"] > time.time()} if time.monotonic() < self.expires_at else {}
 
     async def login(self, session):
         """Use website credentials to obtain a token without touching OpenAPI auth."""
@@ -358,16 +300,10 @@ class FoxCloudStream:
 
     async def accept_values(self, values, age):
         """Publish a source transition once and retain its bounded status snapshot."""
-        # Keep cumulative energy on one source. Switching between website and
-        # OpenAPI counters can roll a total backwards and corrupt energy history.
-        values = fox_cloud_planner_values({key: item for key, item in values.items() if item.get("unit") not in ("Wh", "kWh")})
-        if not values:
-            return
         sampled_at = time.time() - age
         for item in values.values():
             item.update(source="fox_cloud", website_version="v2", sample_age_known=True, sample_time=sampled_at, sample_time_estimated=True, valid_until=sampled_at + FOX_CLOUD_MAX_AGE)
-        self.values = values
-        self.observed_values.update(values)
+        self.values.update(values)
         self.expires_at = time.monotonic() + FOX_CLOUD_MAX_AGE - age
         self.received_data = True
         if self.active_version != "v2":
@@ -393,8 +329,7 @@ class FoxCloudStream:
                 if now >= recovery_deadline:
                     self.owner.log(f"Warn: Fox: v2 website freshness deadline reached for {self.device_sn} (last frame errno={last_errno}, timeDiff={last_age}s, getdata requests={requests_sent})")
                     raise asyncio.TimeoutError("No fresh website readings")
-                if now >= deadline and self.values:
-                    self.values = {}
+                if now >= deadline and self.expires_at:
                     self.expires_at = 0
                     self.active_version = None
                     self.owner.log(f"Warn: Fox: v2 website readings expired for {self.device_sn}; using freshest known status while retaining socket for recovery")
@@ -405,7 +340,7 @@ class FoxCloudStream:
                     await socket.send_str("getdata")
                     requests_sent += 1
                     next_request = now + 30
-                wake_deadline = min(recovery_deadline, next_request, deadline if self.values else recovery_deadline)
+                wake_deadline = min(recovery_deadline, next_request, deadline)
                 try:
                     message = await asyncio.wait_for(socket.receive(), timeout=max(0, wake_deadline - now))
                 except asyncio.TimeoutError:
@@ -477,8 +412,7 @@ class FoxCloudStream:
                     if renewal is not None:
                         renewal.cancel()
                         await asyncio.gather(renewal, return_exceptions=True)
-                    had_live_data = bool(self.values)
-                    self.values = {}
+                    had_live_data = bool(self.expires_at)
                     self.expires_at = 0
                     self.active_version = None
                     await self.owner.publish_cloud_data(self.device_sn, refresh=had_live_data)
@@ -2435,10 +2369,8 @@ class FoxAPI(ComponentBase, OAuthMixin):
 
         cloud_variables = {}
         for sn, stream in getattr(self, "cloud_streams", {}).items():
-            live = fox_cloud_planner_values(stream.current_values())
-            observed = fox_cloud_planner_values({**stream.observed_values, **stream.values})
-            cloud_variables[sn] = {key.lower() for key in observed}
-            device_values[sn] = fox_latest_status_values(device_values.get(sn, {}), observed, {key.casefold() for key in live}, self.local_tz, time.time())
+            cloud_variables[sn] = {key.lower() for key in stream.values}
+            device_values[sn] = fox_latest_status_values(device_values.get(sn, {}), stream.values, {key.casefold() for key in stream.current_values()}, self.local_tz, time.time())
 
         # Publish device values
         for sn in device_values:
@@ -2458,14 +2390,9 @@ class FoxAPI(ComponentBase, OAuthMixin):
                     "source": item.get("source", "openapi"),
                     "timestamp": item.get("timestamp", ""),
                 }
-                if "valid_until" in item:
-                    attributes["valid_until"] = item["valid_until"]
-                for key in ("sample_time", "sample_age_seconds", "sample_time_estimated", "cached"):
+                for key in ("valid_until", "sample_time", "sample_age_seconds", "sample_time_estimated", "cached", "website_version", "sample_age_known"):
                     if key in item:
                         attributes[key] = item[key]
-                if "website_version" in item:
-                    attributes["website_version"] = item["website_version"]
-                    attributes["sample_age_known"] = item.get("sample_age_known", False)
                 # Set device and state class
                 if units in ["kWh", "Wh"]:
                     attributes["device_class"] = "energy"
