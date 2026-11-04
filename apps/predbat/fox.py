@@ -389,7 +389,7 @@ def groups_to_v3(groups, extra_extra_param=None):
 class FoxAPI(ComponentBase, OAuthMixin):
     """Fox API client."""
 
-    def initialize(self, key, automatic, automatic_ignore_pv=False, inverter_sn=None, auth_method=None, token_expires_at=None, token_hash=None, cloud_username=None, cloud_password=None):
+    def initialize(self, key, automatic, automatic_ignore_pv=False, inverter_sn=None, auth_method=None, token_expires_at=None, token_hash=None, cloud_username=None, cloud_password=None, cloud_expensive=False):
         """Initialise the Fox API component"""
         self.key = key
         self.automatic = automatic
@@ -432,6 +432,7 @@ class FoxAPI(ComponentBase, OAuthMixin):
         self.last_midnight_utc = None
         self.cloud_username = cloud_username
         self.cloud_password = cloud_password
+        self.cloud_expensive = cloud_expensive
         self.cloud_streams = {}
         self.cloud_device_list = None
         if bool(cloud_username) != bool(cloud_password):

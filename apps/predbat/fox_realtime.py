@@ -239,23 +239,25 @@ class FoxCloudStream:
         await self.owner.publish_cloud_data(self.device_sn)
 
     async def listen(self, session, token):
-        """Receive fresh flow frames; cached frames cannot extend the deadline."""
+        """Keep responsive sockets open, optionally reconnecting when live data expires."""
+        expensive = getattr(self.owner, "cloud_expensive", False)
         query = urlencode({"plantId": self.plant_id, "token": token, "platform": "web", "lang": FOX_LANG})
         url = FOX_DOMAIN.replace("https://", "wss://") + FOX_CLOUD_WS_PATH + "?" + query
         async with session.ws_connect(url, timeout=aiohttp.ClientWSTimeout(ws_close=5), max_msg_size=1024 * 1024) as socket:
             await socket.send_str("getdata")
-            deadline = time.monotonic() + FOX_CLOUD_MAX_AGE
-            recovery_deadline = deadline
-            # Match the portal's idle requests while keeping data expiry
-            # separate: the browser can recover on this socket after a gap.
+            deadline = float("inf")
+            recovery_deadline = time.monotonic() + FOX_CLOUD_MAX_AGE
+            # Match the portal's idle requests. Responsive cached frames keep
+            # the default connection alive, but never renew reading freshness.
             next_request = time.monotonic() + 30
             requests_sent = 1
             last_age = last_errno = None
             while True:
                 now = time.monotonic()
                 if now >= recovery_deadline:
-                    self.owner.log(f"Warn: Fox: v2 website freshness deadline reached for {self.device_sn} (last frame errno={last_errno}, timeDiff={last_age}s, getdata requests={requests_sent})")
-                    raise asyncio.TimeoutError("No fresh website readings")
+                    reason = "freshness" if expensive else "response"
+                    self.owner.log(f"Warn: Fox: v2 website {reason} deadline reached for {self.device_sn} (last frame errno={last_errno}, timeDiff={last_age}s, getdata requests={requests_sent})")
+                    raise asyncio.TimeoutError("Website stream deadline reached")
                 if now >= deadline and self.expires_at:
                     self.expires_at = 0
                     self.owner.log(f"Warn: Fox: v2 website readings expired for {self.device_sn}; using freshest known status while retaining socket for recovery")
@@ -287,13 +289,15 @@ class FoxCloudStream:
                 last_errno = fox_cloud_number(data.get("errno")) if isinstance(data, dict) else None
                 result = data.get("result") if isinstance(data, dict) else None
                 last_age = fox_cloud_number(result.get("timeDiff")) if isinstance(result, dict) else None
+                if not expensive and last_errno == 0 and last_age is not None and last_age >= 0 and isinstance(result.get("node"), dict):
+                    recovery_deadline = time.monotonic() + FOX_CLOUD_RECOVERY_SECONDS
                 values, age = fox_cloud_values(data)
                 if not values:
                     continue
-                received_at = time.monotonic()
                 await self.accept_values(values, age)
                 deadline = self.expires_at
-                recovery_deadline = received_at + FOX_CLOUD_RECOVERY_SECONDS
+                if expensive:
+                    recovery_deadline = deadline
 
     async def run(self):
         """Run one v2 session/retry loop, retaining cached status between connections."""

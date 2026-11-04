@@ -61,6 +61,22 @@ def context(value):
 class TestFoxLiveMapping(unittest.TestCase):
     """Check the actual portal field names, units, direction and freshness."""
 
+    def test_expensive_mode_is_optional_and_registered_as_a_boolean(self):
+        """Both configuration paths default to a persistent website connection."""
+        from components import COMPONENT_LIST
+        from config import APPS_SCHEMA
+
+        option = COMPONENT_LIST["fox"]["args"]["cloud_expensive"]
+        self.assertFalse(option["required"])
+        self.assertIs(option["default"], False)
+        self.assertEqual(option["config"], "fox_cloud_expensive")
+        self.assertEqual(APPS_SCHEMA[option["config"]], {"type": "boolean"})
+        fox = make_fox()
+        fox.initialize("open-key", False)
+        self.assertIs(fox.cloud_expensive, False)
+        fox.initialize("open-key", False, cloud_expensive=True)
+        self.assertIs(fox.cloud_expensive, True)
+
     def test_signed_planner_power_requires_complete_valid_live_pairs(self):
         """Map a valid node directly; invalid power cannot create any battery power sensor."""
         self.assertEqual(fox_cloud_values(live_frame())[0]["invBatPower"]["value"], -2)

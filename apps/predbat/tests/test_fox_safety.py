@@ -61,6 +61,88 @@ class TestFoxWebsiteSafety(unittest.IsolatedAsyncioTestCase):
         await self.stream.accept_values(values, age)
         self.sync_publication()
 
+    def cloud_session_for_events(self, events):
+        """Supply timed frames, scheduled wakeups and closure to the actual reader."""
+        events = iter(events)
+
+        async def receive():
+            """Advance both clocks without real sleeps or network traffic."""
+            tick, payload = next(events)
+            self.wall += tick - self.monotonic
+            self.monotonic = tick
+            if payload is None:
+                raise asyncio.TimeoutError()
+            if payload == "closed":
+                return MagicMock(type=aiohttp.WSMsgType.CLOSED)
+            message = MagicMock(type=aiohttp.WSMsgType.TEXT)
+            message.json.return_value = payload
+            return message
+
+        socket = SimpleNamespace(send_str=AsyncMock(), receive=receive)
+        session = MagicMock()
+        session.ws_connect.return_value = context(socket)
+        return session, socket
+
+    async def test_default_socket_survives_cached_replies_and_sparse_fresh_samples(self):
+        """Browser-style gaps retain one socket without promoting stale SoC to fresh."""
+        events = [(100, live_frame(soc=23)), (125, None), (130, None), (131, live_frame(soc=99, age=61))]
+        for index in range(9):
+            events.extend([(161 + 31 * index, None), (162 + 31 * index, live_frame(soc=99, age=92 + 31 * index))])
+        events.extend([(411, live_frame(soc=24)), (436, None), (437, "closed")])
+        session, socket = self.cloud_session_for_events(events)
+        with self.assertRaises(ConnectionError):
+            await self.stream.listen(session, "private-token")
+        session.ws_connect.assert_called_once()
+        self.assertEqual(socket.send_str.await_count, 11)
+        reading = self.fox.dashboard_items["sensor.predbat_fox_sn1_soc"]
+        self.assertEqual(reading["state"], 24)
+        self.assertEqual(reading["attributes"]["source"], "fox_cloud_cached")
+        self.assertEqual(reading["attributes"]["sample_time"], 1_000_306)
+        self.assertFalse(self.stream.current_values())
+        self.assertEqual(sum("v2 website status active" in message for message in self.fox.log_messages), 2)
+        self.assertFalse(any("deadline reached" in message for message in self.fox.log_messages))
+
+    async def test_default_socket_can_start_with_only_cached_replies(self):
+        """A responsive cached stream need not reconnect before its first fresh sample."""
+        session, socket = self.cloud_session_for_events([(100, live_frame(soc=99, age=61)), (130, None), (131, live_frame(soc=99, age=92)), (132, "closed")])
+        with self.assertRaises(ConnectionError):
+            await self.stream.listen(session, "private-token")
+        self.assertEqual(self.stream.values, {})
+        self.assertFalse(self.fox.dashboard_items)
+        self.assertEqual(socket.send_str.await_count, 2)
+
+    async def test_default_socket_still_reconnects_when_cached_responses_stop(self):
+        """Idle requests alone cannot keep an unresponsive socket open indefinitely."""
+        events = [(100, live_frame(age=61)), (130, None), (131, live_frame(age=92))] + [(tick, None) for tick in (161, 191, 221, 251)]
+        session, socket = self.cloud_session_for_events(events)
+        with self.assertRaises(asyncio.TimeoutError):
+            await self.stream.listen(session, "private-token")
+        self.assertEqual(self.monotonic, 251)
+        self.assertEqual(socket.send_str.await_count, 5)
+        self.assertIn("response deadline reached", str(self.fox.log_messages))
+
+    async def test_expensive_mode_reconnects_on_freshness_expiry_despite_cached_replies(self):
+        """The opt-in mode renews a stale feed without accepting the cached payload."""
+        self.fox.cloud_expensive = True
+        events = [(100, live_frame(soc=23)), (110, live_frame(soc=99, age=61)), (120, live_frame(soc=99, age=62)), (125, None)]
+        session, socket = self.cloud_session_for_events(events)
+        with self.assertRaises(asyncio.TimeoutError):
+            await self.stream.listen(session, "private-token")
+        self.assertEqual(self.monotonic, 125)
+        self.assertEqual(self.stream.values["SoC"]["value"], 23)
+        self.assertFalse(self.stream.current_values())
+        socket.send_str.assert_awaited_once_with("getdata")
+        self.assertIn("freshness deadline reached", str(self.fox.log_messages))
+
+    async def test_expensive_mode_keeps_a_healthy_stream_open(self):
+        """Regular pushes require no extra requests even in continuous mode."""
+        self.fox.cloud_expensive = True
+        session, socket = self.cloud_session_for_events([(tick, live_frame()) for tick in range(100, 151, 5)] + [(151, "closed")])
+        with self.assertRaises(ConnectionError):
+            await self.stream.listen(session, "private-token")
+        session.ws_connect.assert_called_once()
+        socket.send_str.assert_awaited_once_with("getdata")
+
     async def test_fresh_live_inputs_and_real_zero_soc_are_valid(self):
         """Zero and full SoC are real values rather than missing data or defaults."""
         for soc in (0, 54.5, 100):

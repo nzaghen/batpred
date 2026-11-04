@@ -1374,6 +1374,7 @@ Integrates with Fox ESS inverters for monitoring and controlling Fox ESS battery
 | `key` | String | Yes | - | `fox_key` | Your Fox ESS API key |
 | `cloud_username` | String | No | unset | `fox_cloud_username` | Fox Cloud website username for optional live SoC and power readings |
 | `cloud_password` | String | No | unset | `fox_cloud_password` | Fox Cloud website password; configure both website credentials to enable live status |
+| `cloud_expensive` | Boolean | No | false | `fox_cloud_expensive` | Reconnect when live readings expire to try to sustain frequent updates; increases website connection traffic |
 | `automatic` | Boolean | No | false | `fox_automatic` | Set to `true` to automatically configured Predbat to use the Fox inverter (no manual `apps.yaml` updates required) |
 | `automatic_ignore_pv` | Boolean | No | false | `fox_automatic_ignore_pv` | When `automatic` is enabled, set to `true` to prevent Fox Cloud from overwriting `pv_power` and `pv_today` config. Useful for AC-coupled setups where PV is measured independently and Fox Cloud reports zero/absent PV data |
 
@@ -1385,6 +1386,7 @@ Add your Fox Cloud **website** credentials alongside the existing API key in `ap
   fox_key: !secret fox_key
   fox_cloud_username: !secret fox_cloud_username
   fox_cloud_password: !secret fox_cloud_password
+  fox_cloud_expensive: false
 ```
 
 Predbat uses the **v2 website and OpenAPI**, selecting the newest valid available sample for each status field. There is no legacy v1 website fallback.
@@ -1405,11 +1407,13 @@ OpenAPI status polling uses its standard five-minute interval. Website updates a
 
 The website reader uses one retry loop. It logs in when it needs a token and reuses that token after a working connection drops. A failed attempt that supplies no status clears the token so the next attempt logs in again. Retries start at five seconds, double up to five minutes after repeated failures, and reset after receiving status. Website tokens are held only in memory. OpenAPI authentication keeps its existing API-key/OAuth handling.
 
-V2 separates data expiry from connection recovery. When a reading reaches its 30-second freshness limit, Predbat removes it from the live snapshot, publishes the newest available v2 or OpenAPI status, and requests an OpenAPI refresh on the next polling cycle. It can keep the same socket open for up to 120 seconds since the last accepted fresh frame, allowing live updates to resume after a gap without logging in again. Cached frames never restart that recovery window. Before the first fresh frame, the initial receive limit remains 30 seconds. Socket clients respond to server pings automatically, without adding a client-generated heartbeat that the browser does not send.
+V2 separates reading freshness from connection health. When a reading reaches its 30-second freshness limit, Predbat removes it from the live snapshot, publishes the newest available v2 or OpenAPI status, and requests an OpenAPI refresh on the next polling cycle. By default, it keeps the same socket open while valid responses arrive, including cached responses. Cached responses keep the connection alive without making any reading fresh. The initial response limit is 30 seconds; after a valid response, 120 seconds without another valid response triggers the existing reconnect loop. Socket clients respond to server pings automatically, without adding a client-generated heartbeat that the browser does not send.
+
+Set `fox_cloud_expensive: true` to try to sustain the frequent live feed. This mode reconnects when accepted readings reach their 30-second freshness limit, rather than waiting on a responsive but stale socket. A frame reporting five seconds of age normally expires 25 seconds after receipt. The existing retry loop reuses the token after a working connection and starts retries after five seconds. This increases connection traffic and is best effort: it cannot guarantee uninterrupted five-second telemetry or force an offline inverter to report. The flag does not change data validation, source selection, OpenAPI polling or inverter commands.
 
 Website failures retain the freshest known status while the retry loop reconnects. Repeated website login failures keep the normal OpenAPI polling interval. No website credentials means the existing OpenAPI behaviour is unchanged.
 
-A normal portal capture on 2026-11-03 contained an approximately 88-second gap in live updates on one socket, with intermediate `timeDiff=61` and `64` frames, followed by `timeDiff=5` recovery. Keeping a connection open therefore does not guarantee fresh inverter data. V2's `lastUpdateDate` may be display text such as "Updated within 1 minute", not a machine-readable timestamp; it is not used as an independent sample clock.
+A browser capture on 2026-11-04 showed roughly five minutes of five-second updates followed by occasional updated snapshots about five minutes apart on the same socket, despite successful idle requests and `preInfo` calls. Default mode follows that connection behaviour; keeping the socket open does not guarantee continuous live telemetry. V2's `lastUpdateDate` may be display text such as "Updated within 1 minute", not a machine-readable timestamp; it is not used as an independent sample clock.
 
 Failures and recovery appear in the normal Predbat log, for example:
 
