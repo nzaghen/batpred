@@ -2098,7 +2098,7 @@ var options = {
         text += "    }\n"
         text += "   ]\n"
         text += "  }\n"
-        text += "}\n"
+        text += "};\n"
         # The title is an HTML heading above the chart, not an ApexCharts title: ApexCharts binds drag-to-zoom to the
         # whole chart SVG, so a drag (or a touch-scroll on mobile) anywhere in a title band inside it - including the
         # gap between the title text and the toolbar - zoomed the chart (#5979). Outside the SVG it cannot start a zoom,

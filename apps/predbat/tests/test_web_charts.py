@@ -139,7 +139,7 @@ def run_web_charts_tests(my_predbat):
     print("Test: render_chart() puts the chart title in an HTML heading outside the chart SVG, where a drag cannot zoom")
     for daily_chart in (True, False):
         html = web.render_chart(series_data, "%", "SoC Chart", now_str, tagname="chart_%", daily_chart=daily_chart)
-        options = html.split("var options = {", 1)[1].split("\n}\n", 1)[0] if "var options = {" in html else ""
+        options = html.split("var options = {", 1)[1].split("\n};\n", 1)[0] if "var options = {" in html else ""
         if not options:
             print(f"  ERROR: test setup assumption wrong - render_chart(daily_chart={daily_chart}) no longer emits 'var options = {{', got: {html}")
             failed += 1
@@ -152,6 +152,11 @@ def run_web_charts_tests(my_predbat):
                 failed += 1
         if html.find("insertBefore(wrapper, container)") > html.find("new ApexCharts("):
             print(f"  ERROR: render_chart(daily_chart={daily_chart}) inserts the heading after the chart is created, got: {html}")
+            failed += 1
+        # Without a statement terminator, JavaScript calls the options object as a function when
+        # the following title function starts with '(', and never reaches the chart constructor.
+        if "\n};\n(function() {" not in html:
+            print(f"  ERROR: render_chart(daily_chart={daily_chart}) does not terminate the options assignment before the title function")
             failed += 1
 
     # A friendly name is free text in HA. Interpolated raw into a JS string literal, an apostrophe broke the whole
